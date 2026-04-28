@@ -1,0 +1,23 @@
+# Base style params
+text.usetex : True
+font.family : serif
+axes.labelsize : 11
+font.size : 11
+legend.fontsize : 11
+xtick.labelsize : 11
+ytick.labelsize : 11
+
+# Legend
+legend.frameon : True
+legend.framealpha : 1
+legend.facecolor : white
+
+# Ticks
+xtick.bottom : True
+ytick.left : True
+xtick.major.size : 6
+ytick.major.size : 6
+xtick.minor.size : 3
+ytick.minor.size : 3
+xtick.direction : out
+ytick.direction : out
