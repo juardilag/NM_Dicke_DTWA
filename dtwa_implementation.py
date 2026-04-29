@@ -68,7 +68,7 @@ def compute_effective_field(S_state, history_array, step_idx, gamma_kernel, nois
     xi_field = 0.5 * noise_traj[step_idx, 0]
     
     # The field is B_bare + Noise + Memory
-    eff_x = 0.5 * B_field[0] + xi_field - memory_x 
+    eff_x = 0.5 * B_field[0] + xi_field + memory_x 
     return jnp.array([eff_x, 0.5 * B_field[1], 0.5 * B_field[2]])
 
 
@@ -106,7 +106,7 @@ def run_integrated_twa_bundle(keys, t_grid, omega_0, alpha, omega_c, s, T, B_fie
     
     def solve_single_trajectory(key):
         k_samp, k_noise = jax.random.split(key)
-        
+        # Sampling initial conditions to account for quantum uncertainty [cite: 261, 282]
         s0 = discrete_spin_sampling_factorized(k_samp, initial_direction, n_spins) / 2.0
         
         noise_traj = generate_colored_noise(
@@ -117,15 +117,17 @@ def run_integrated_twa_bundle(keys, t_grid, omega_0, alpha, omega_c, s, T, B_fie
         def scan_body(carry, idx):
             return heun_step_non_markovian(carry, idx, noise_traj, gamma_kernel_fine, B_field, dt)
 
+        # Solving the stochastic EOM for the spin vector [cite: 138, 275]
         final_traj, _ = jax.lax.scan(scan_body, history_init, jnp.arange(1, num_steps))
         return final_traj
 
     @jax.jit
-    def process_batch_sum(batch_keys):
-        batch_trajs = jax.vmap(solve_single_trajectory)(batch_keys)
-        return jnp.sum(batch_trajs, axis=0)
+    def process_batch(batch_keys):
+        # Return all trajectories in the batch
+        return jax.vmap(solve_single_trajectory)(batch_keys)
 
-    total_sum = jnp.zeros((num_steps, 3))
+    # List to store batches of trajectories
+    all_trajectories = []
     n_batches = int(jnp.ceil(n_total / batch_size))
     
     print(f"Starting Riemann DTWA: {n_total} trajectories in {n_batches} batches.")
@@ -134,6 +136,23 @@ def run_integrated_twa_bundle(keys, t_grid, omega_0, alpha, omega_c, s, T, B_fie
         start_idx = i * batch_size
         end_idx = min((i + 1) * batch_size, n_total)
         current_keys = keys[start_idx:end_idx]
-        total_sum += process_batch_sum(current_keys)
+        # Append the full batch (batch_size, num_steps, 3)
+        all_trajectories.append(process_batch(current_keys))
         
-    return total_sum / n_total
+    # Return the full 3D ensemble [cite: 346, 353]
+    return jnp.concatenate(all_trajectories, axis=0)
+
+def calculate_correlation(sx_trajectories):
+    """
+    sx_trajectories: Array of shape (n_trajectories, n_timesteps)
+    Returns: 2D array C(t, t')
+    """
+    n_traj, n_steps = sx_trajectories.shape
+    # Subtract the mean to get fluctuations: δSx = Sx - <Sx>
+    mean_sx = jnp.mean(sx_trajectories, axis=0)
+    fluctuations = sx_trajectories - mean_sx
+    
+    # Compute the average over trajectories
+    # C[t, t'] = (1/N) * sum( δSx(t) * δSx(t') )
+    C = (fluctuations.T @ fluctuations) / n_traj
+    return C
