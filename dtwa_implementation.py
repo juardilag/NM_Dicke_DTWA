@@ -33,25 +33,29 @@ def compute_non_markovian_bath_functions(num_steps, dt, omega_0, alpha, omega_c,
     
     return gamma_kernel, jnp.where(S_w < 0, 0, S_w), chi_R_t, dw, cos_wt, sin_wt
 
-@jax.jit(static_argnames=['num_steps'])
-def generate_colored_noise(key, num_steps, dt, S_w, chi_R_t, dw, cos_wt, sin_wt, omega_0, g, n_photons_initial, n_spins):
+@jax.jit(static_argnames=['num_steps', 'use_noise'])
+def generate_colored_noise(key, num_steps, dt, S_w, chi_R_t, dw, cos_wt, sin_wt, omega_0, g, n_photons_initial, n_spins, use_noise=True):
     k_init_re, k_init_im, k_re, k_im = jax.random.split(key, 4)
     
-    # 1. Classical Noise from Bath
+    # 1. Classical Noise from Bath (Set to zero if use_noise=False)
     amp = jnp.sqrt(S_w * dw / (2.0 * jnp.pi))
-    bath_noise_t = jnp.dot(cos_wt, jax.random.normal(k_re, S_w.shape) * amp) + \
-                   jnp.dot(sin_wt, jax.random.normal(k_im, S_w.shape) * amp)
+    # If use_noise is False, the bath contribution is strictly zero
+    bath_noise_t = jnp.where(use_noise, 
+                             jnp.dot(cos_wt, jax.random.normal(k_re, S_w.shape) * amp) + \
+                             jnp.dot(sin_wt, jax.random.normal(k_im, S_w.shape) * amp),
+                             0.0)
     
     # 2. Transient from Initial Cavity State
-    alpha_0 = jnp.sqrt(n_photons_initial) + (jax.random.normal(k_init_re)*jnp.sqrt(0.5) + 1j*jax.random.normal(k_init_im)*jnp.sqrt(0.5))
+    # If use_noise is False, we use the deterministic sqrt(n_photons) without the 0.5-width Gaussian
+    alpha_noise = jax.random.normal(k_init_re)*jnp.sqrt(0.5) + 1j*jax.random.normal(k_init_im)*jnp.sqrt(0.5)
+    alpha_0 = jnp.sqrt(n_photons_initial) + jnp.where(use_noise, alpha_noise, 0.0j)
+    
     t_grid = jnp.arange(num_steps) * dt
     norm = jnp.where(jnp.abs(chi_R_t[0]) > 1e-10, chi_R_t[0], 1.0)
     
-    # phi = 2*Re[alpha]
     phi_transient = 2.0 * jnp.real(alpha_0 * jnp.exp(-1j*omega_0*t_grid) * (chi_R_t/norm))
     phi_total = phi_transient + bath_noise_t
     
-    # DEBUG FIX: The effective field carries a MINUS sign (B = -dH/dJ)
     xi_x = -(2.0 * g / jnp.sqrt(n_spins)) * phi_total
     return jnp.zeros((num_steps, 3)).at[:, 0].set(xi_x)
 
@@ -96,7 +100,13 @@ def heun_step_non_markovian(state_trajectory, step_idx, noise_traj, gamma_kernel
     return state_trajectory.at[step_idx].set(S_next), S_next
 
 
-def run_integrated_twa_bundle(keys, t_grid, omega_0, alpha, omega_c, s, T, B_field, g, n_photons_initial, initial_direction, batch_size=1000, n_spins=1, w_max=20.0, N_w=2000):
+def run_integrated_twa_bundle(keys, t_grid, omega_0, alpha, omega_c, s, T, B_field, g, n_photons_initial, initial_direction, 
+                              batch_size=10_000, n_spins=1, w_max=20.0, N_w=2000, 
+                              use_noise=True, use_sampling=True):
+    """
+    Modified bundle to allow Mean-Field (use_noise=False, use_sampling=False) 
+    or TWA (use_noise=True, use_sampling=True) simulations.
+    """
     dt = t_grid[1] - t_grid[0]
     num_steps = t_grid.shape[0]
     n_total = keys.shape[0]
@@ -106,40 +116,41 @@ def run_integrated_twa_bundle(keys, t_grid, omega_0, alpha, omega_c, s, T, B_fie
     
     def solve_single_trajectory(key):
         k_samp, k_noise = jax.random.split(key)
-        # Sampling initial conditions to account for quantum uncertainty [cite: 261, 282]
-        s0 = discrete_spin_sampling_factorized(k_samp, initial_direction, n_spins) / 2.0
         
+        # Initial condition: sampled from Wigner [cite: 137] or deterministic classical vector
+        s0_sampled = discrete_spin_sampling_factorized(k_samp, initial_direction, n_spins) / 2.0
+        s0_mean = (initial_direction * n_spins) / 2.0
+        s0 = jnp.where(use_sampling, s0_sampled, s0_mean)
+        
+        # Generate noise trajectory (will be deterministic if use_noise=False)
         noise_traj = generate_colored_noise(
-            k_noise, num_steps, dt, S_w, chi_R_t, dw, cos_wt, sin_wt, omega_0, g, n_photons_initial, n_spins)
+            k_noise, num_steps, dt, S_w, chi_R_t, dw, cos_wt, sin_wt, omega_0, g, n_photons_initial, n_spins, use_noise=use_noise)
         
         history_init = jnp.zeros((num_steps, 3)).at[0].set(s0)
         
         def scan_body(carry, idx):
-            return heun_step_non_markovian(carry, idx, noise_traj, gamma_kernel_fine, B_field, dt)
+            current_B = B_field[idx] 
+            return heun_step_non_markovian(carry, idx, noise_traj, gamma_kernel_fine, current_B, dt)
 
-        # Solving the stochastic EOM for the spin vector [cite: 138, 275]
         final_traj, _ = jax.lax.scan(scan_body, history_init, jnp.arange(1, num_steps))
         return final_traj
 
     @jax.jit
     def process_batch(batch_keys):
-        # Return all trajectories in the batch
         return jax.vmap(solve_single_trajectory)(batch_keys)
 
-    # List to store batches of trajectories
     all_trajectories = []
     n_batches = int(jnp.ceil(n_total / batch_size))
     
-    print(f"Starting Riemann DTWA: {n_total} trajectories in {n_batches} batches.")
+    mode_name = "TWA" if use_noise else "Mean-Field"
+    print(f"Starting Riemann {mode_name}: {n_total} trajectories in {n_batches} batches.")
     
-    for i in tqdm(range(n_batches), desc="Integrated DTWA Batches"):
+    for i in tqdm(range(n_batches), desc=f"Integrated {mode_name} Batches"):
         start_idx = i * batch_size
         end_idx = min((i + 1) * batch_size, n_total)
         current_keys = keys[start_idx:end_idx]
-        # Append the full batch (batch_size, num_steps, 3)
         all_trajectories.append(process_batch(current_keys))
         
-    # Return the full 3D ensemble [cite: 346, 353]
     return jnp.concatenate(all_trajectories, axis=0)
 
 def calculate_correlation(sx_trajectories):
@@ -156,3 +167,18 @@ def calculate_correlation(sx_trajectories):
     # C[t, t'] = (1/N) * sum( δSx(t) * δSx(t') )
     C = (fluctuations.T @ fluctuations) / n_traj
     return C
+
+def calculate_response(dt, t_prime_idx, perturbed_mean_sx, reference_mean_sx, h_strength):
+    """
+    Calculates χ(t, t') = δ<Sx(t)> / δh(t')
+    """
+    # Difference in the average evolution
+    delta_sx = perturbed_mean_sx - reference_mean_sx
+    
+    # Response is the change divided by the perturbation strength
+    chi = delta_sx / (h_strength * dt)
+    
+    # Ensure causality: chi = 0 for t < t' using JAX's immutable update syntax
+    chi = chi.at[:t_prime_idx].set(0.0)
+    
+    return chi
