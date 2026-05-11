@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-# Import only necessary TWA functions
+# Import implementation functions
 from dtwa_implementation import (
     run_integrated_twa_bundle,
     calculate_correlation
@@ -12,20 +12,18 @@ from dtwa_implementation import (
 params = {
     "n_spins": 1000,
     "omega_0": 1.0,
-    "B_x": 0.0,
-    "B_y": 0.0,
     "B_z": 1.0,
     "g": 1.0,
     "T": 0.75,
     "alpha": 0.01,
     "omega_c": 2.5,
-    "s": 1.0,
+    "s": 0.5,
     "initial_direction": [0.01, 0.0, 0.99],
     "n_photons_initial": 0.0,
-    "t_max": 80,
+    "t_max": 150,
     "n_steps": 5_000,
-    "n_trajectories": 10_000,
-    "batch_size": 25_000
+    "n_trajectories": 20_000,
+    "batch_size": 10_000 # Adjusted for typical memory constraints
 }
 
 # ==========================================
@@ -52,32 +50,41 @@ spin_ensemble = run_integrated_twa_bundle(
 )
 
 # ==========================================
-# 3. Calculate Observables
+# 3. Calculate Robust Observables
 # ==========================================
-print("Calculating Dynamics and Correlations...")
+print("Calculating Observables...")
 
-# Mean trajectories (Dynamics)
-mean_traj = jnp.mean(spin_ensemble, axis=0) / j_val
+# Normalized Jx trajectories for all realizations
+sx_norm = spin_ensemble[:, :, 0] / j_val
 
-# Symmetric Correlation: C(t, t')
-sx_all_times = spin_ensemble[:, :, 2] / j_val
-correlation = calculate_correlation(sx_all_times)
+# 1. Root Mean Square (RMS): sqrt(<Jx^2>)
+rms_jx = jnp.sqrt(jnp.mean(sx_norm**2, axis=0))
+
+# 2. Absolute Mean: <|Jx|>
+abs_jx = jnp.mean(jnp.abs(sx_norm), axis=0)
+
+# 3. Longitudinal Magnetization: <Jz> (already invariant)
+mean_jz = jnp.mean(spin_ensemble[:, :, 2], axis=0) / j_val
+
+# 4. Correlation Matrix C(t, t') using Jx
+correlation = calculate_correlation(sx_norm)
 
 # ==========================================
 # 4. Plotting
 # ==========================================
 plt.style.use('seaborn-v0_8-white')
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
-# Panel 1: Dynamics
-ax1.plot(t_grid, mean_traj[:, 0], label=r'$\langle J_x \rangle / j$', lw=1.5)
-ax1.plot(t_grid, mean_traj[:, 1], label=r'$\langle J_y \rangle / j$', lw=1.5)
-ax1.plot(t_grid, mean_traj[:, 2], label=r'$\langle J_z \rangle / j$', lw=1.5)
-#ax1.set_title("Spin Dynamics (Expectation Values)")
+# Panel 1: Dynamics of Order Parameters
+ax1.plot(t_grid, mean_jz, label=r'$\langle J_z \rangle / j$', color='teal', lw=2)
+ax1.plot(t_grid, rms_jx, label=r'$\sqrt{\langle J_x^2 \rangle} / j$', color='crimson', linestyle='--', lw=1.5)
+ax1.plot(t_grid, abs_jx, label=r'$\langle |J_x| \rangle / j$', color='darkorange', linestyle=':', lw=1.5)
+
+ax1.set_title("DTWA Dynamics (Parity-Invariant Observables)")
 ax1.set_xlabel("Time")
-ax1.set_ylabel("Normalization")
+ax1.set_ylabel("Amplitude")
 ax1.set_ylim(-1.1, 1.1)
-ax1.legend(loc='upper right')
+ax1.legend(loc='best')
 ax1.grid(alpha=0.3)
 
 # Panel 2: Correlation Matrix
