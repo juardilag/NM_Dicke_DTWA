@@ -7,56 +7,58 @@ import jax
 from initial_samplings import discrete_spin_sampling_factorized
 from tqdm import tqdm
 
-@jax.jit(static_argnames=['num_steps', 'N_w'])
-def compute_non_markovian_bath_functions(num_steps, dt, omega_0, alpha, omega_c, s, T, g, n_spins, w_max=20.0, N_w=2000):
-    t_grid = jnp.arange(num_steps) * dt
-    w_grid = jnp.linspace(-w_max, w_max, N_w)
+@jax.jit(static_argnames=['num_steps', 'N_fft'])
+def compute_non_markovian_bath_functions(num_steps, dt, omega_0, alpha, omega_c, s, T, g, n_spins, w_max=50.0, N_fft=16384):
+    t_sim_grid = jnp.arange(num_steps) * dt
+    w_grid = jnp.linspace(0, w_max, N_fft // 2 + 1)
     dw = w_grid[1] - w_grid[0]
     
-    # J(w) definition
-    abs_w = jnp.abs(w_grid)
-    J_w = jnp.where(w_grid != 0, jnp.sign(w_grid) * alpha * omega_c * (abs_w/omega_c)**s * jnp.exp(-abs_w/omega_c), 0.0)
+    # J(w) definition [cite: 73]
+    J_w = alpha * omega_c * (w_grid/omega_c)**s * jnp.exp(-w_grid/omega_c)
     
-    # chi^R(w)
+    # chi^R(w) calculation [cite: 31, 77]
     Sigma_R = -1j * jnp.pi * J_w 
     chi_R_w = 1.0 / (w_grid - omega_0 - Sigma_R + 1e-10j) - 1.0 / (w_grid + omega_0 - Sigma_R + 1e-10j)
     
-    # Time-frequency matrices
-    wt = t_grid[:, None] * w_grid[None, :]
-    cos_wt, sin_wt = jnp.cos(wt), jnp.sin(wt)
-    chi_R_t = jnp.real(jnp.dot(cos_wt - 1j*sin_wt, chi_R_w) * dw / (2.0 * jnp.pi))
+    # Robust IFFT 
+    chi_R_t_full = jnp.fft.irfft(chi_R_w, n=N_fft) * (N_fft * dw / jnp.pi)
     
-    # FACTOR FIX: Matches your compute_memory_kernel logic
-    gamma_kernel = 4.0 * ((g**2) / n_spins) * chi_R_t
+    # --- FIX: Map FFT time-steps to Simulation time-steps ---
+    t_fft_grid = jnp.arange(N_fft) * (jnp.pi / w_max)
+    chi_R_t = jnp.interp(t_sim_grid, t_fft_grid, chi_R_t_full)
+    # -------------------------------------------------------
     
-    S_w = -jnp.imag(chi_R_w) * jnp.where(abs_w > 1e-10, 1.0/jnp.tanh(abs_w/(2.0*T + 1e-12)), 0.0)
+    gamma_kernel = 4.0 * ((g**2) / n_spins) * chi_R_t 
+    S_w = -jnp.imag(chi_R_w) * jnp.where(w_grid > 1e-10, 1.0/jnp.tanh(w_grid/(2.0*T + 1e-12)), 0.0) 
     
-    return gamma_kernel, jnp.where(S_w < 0, 0, S_w), chi_R_t, dw, cos_wt, sin_wt
+    return gamma_kernel, S_w, chi_R_t, dw, w_grid
 
 @jax.jit(static_argnames=['num_steps', 'use_noise'])
-def generate_colored_noise(key, num_steps, dt, S_w, chi_R_t, dw, cos_wt, sin_wt, omega_0, g, n_photons_initial, n_spins, use_noise=True):
-    k_init_re, k_init_im, k_re, k_im = jax.random.split(key, 4)
+def generate_colored_noise(key, num_steps, dt, S_w, w_grid, dw, omega_0, g, n_photons_initial, n_spins, use_noise=True):
+    k_init, k_noise = jax.random.split(key)
+    N_fft_noise = (len(S_w) - 1) * 2
+    t_sim_grid = jnp.arange(num_steps) * dt
     
-    # 1. Classical Noise from Bath (Set to zero if use_noise=False)
-    amp = jnp.sqrt(S_w * dw / (2.0 * jnp.pi))
-    # If use_noise is False, the bath contribution is strictly zero
-    bath_noise_t = jnp.where(use_noise, 
-                             jnp.dot(cos_wt, jax.random.normal(k_re, S_w.shape) * amp) + \
-                             jnp.dot(sin_wt, jax.random.normal(k_im, S_w.shape) * amp),
-                             0.0)
+    # Frequency Domain Noise Construction [cite: 124]
+    rand_re = jax.random.normal(k_noise, (len(S_w),))
+    rand_im = jax.random.normal(k_noise + 1, (len(S_w),))
+    noise_w = (rand_re + 1j*rand_im) * jnp.sqrt(S_w * dw / (2.0 * jnp.pi))
     
-    # 2. Transient from Initial Cavity State
-    # If use_noise is False, we use the deterministic sqrt(n_photons) without the 0.5-width Gaussian
-    alpha_noise = jax.random.normal(k_init_re)*jnp.sqrt(0.5) + 1j*jax.random.normal(k_init_im)*jnp.sqrt(0.5)
-    alpha_0 = jnp.sqrt(n_photons_initial) + jnp.where(use_noise, alpha_noise, 0.0j)
+    # Transform to Time Domain
+    bath_noise_full = jnp.fft.irfft(noise_w, n=N_fft_noise) * N_fft_noise
     
-    t_grid = jnp.arange(num_steps) * dt
-    norm = jnp.where(jnp.abs(chi_R_t[0]) > 1e-10, chi_R_t[0], 1.0)
+    # --- FIX: Interpolate noise to simulation grid ---
+    t_fft_noise = jnp.arange(N_fft_noise) * (jnp.pi / jnp.max(w_grid))
+    bath_noise_t = jnp.interp(t_sim_grid, t_fft_noise, bath_noise_full)
+    bath_noise_t = jnp.where(use_noise, bath_noise_t, 0.0)
+    # -------------------------------------------------
     
-    phi_transient = 2.0 * jnp.real(alpha_0 * jnp.exp(-1j*omega_0*t_grid) * (chi_R_t/norm))
+    alpha_0 = jnp.sqrt(n_photons_initial)
+    phi_transient = 2.0 * jnp.real(alpha_0 * jnp.exp(-1j*omega_0*t_sim_grid)) 
+    
     phi_total = phi_transient + bath_noise_t
-    
     xi_x = -(2.0 * g / jnp.sqrt(n_spins)) * phi_total
+    
     return jnp.zeros((num_steps, 3)).at[:, 0].set(xi_x)
 
 @jax.jit
@@ -101,30 +103,27 @@ def heun_step_non_markovian(state_trajectory, step_idx, noise_traj, gamma_kernel
 
 
 def run_integrated_twa_bundle(keys, t_grid, omega_0, alpha, omega_c, s, T, B_field, g, n_photons_initial, initial_direction, 
-                              batch_size=10_000, n_spins=1, w_max=20.0, N_w=2000, 
+                              batch_size=10_000, n_spins=1, 
                               use_noise=True, use_sampling=True):
-    """
-    Modified bundle to allow Mean-Field (use_noise=False, use_sampling=False) 
-    or TWA (use_noise=True, use_sampling=True) simulations.
-    """
     dt = t_grid[1] - t_grid[0]
     num_steps = t_grid.shape[0]
     n_total = keys.shape[0]
     
-    gamma_kernel_fine, S_w, chi_R_t, dw, cos_wt, sin_wt = compute_non_markovian_bath_functions(
-        num_steps, dt, omega_0, alpha, omega_c, s, T, g, n_spins, w_max, N_w)
+    # UPDATED: Returns w_grid instead of sin/cos matrices
+    gamma_kernel_fine, S_w, chi_R_t, dw, w_grid = compute_non_markovian_bath_functions(
+        num_steps, dt, omega_0, alpha, omega_c, s, T, g, n_spins)
     
     def solve_single_trajectory(key):
         k_samp, k_noise = jax.random.split(key)
         
-        # Initial condition: sampled from Wigner [cite: 137] or deterministic classical vector
+        # Initial condition: sampled from Wigner [cite: 137] or deterministic vector
         s0_sampled = discrete_spin_sampling_factorized(k_samp, initial_direction, n_spins) / 2.0
         s0_mean = (initial_direction * n_spins) / 2.0
         s0 = jnp.where(use_sampling, s0_sampled, s0_mean)
         
-        # Generate noise trajectory (will be deterministic if use_noise=False)
+        # UPDATED: Passes w_grid to the noise generator
         noise_traj = generate_colored_noise(
-            k_noise, num_steps, dt, S_w, chi_R_t, dw, cos_wt, sin_wt, omega_0, g, n_photons_initial, n_spins, use_noise=use_noise)
+            k_noise, num_steps, dt, S_w, w_grid, dw, omega_0, g, n_photons_initial, n_spins, use_noise=use_noise)
         
         history_init = jnp.zeros((num_steps, 3)).at[0].set(s0)
         
@@ -143,7 +142,7 @@ def run_integrated_twa_bundle(keys, t_grid, omega_0, alpha, omega_c, s, T, B_fie
     n_batches = int(jnp.ceil(n_total / batch_size))
     
     mode_name = "TWA" if use_noise else "Mean-Field"
-    print(f"Starting Riemann {mode_name}: {n_total} trajectories in {n_batches} batches.")
+    print(f"Starting {mode_name}: {n_total} trajectories in {n_batches} batches.")
     
     for i in tqdm(range(n_batches), desc=f"Integrated {mode_name} Batches"):
         start_idx = i * batch_size
