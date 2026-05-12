@@ -201,7 +201,7 @@ def extract_stationary_correlation(C_matrix):
     return c_tau
 
 @jax.jit(static_argnames=['N_w'])
-def fourier_transform_correlation(c_tau, t_grid, w_max=10.0, N_w=1000):
+def fourier_transform_correlation(c_tau, t_grid, w_max=2.5, N_w=5000):
     """
     Performs a manual Riemann Fourier Transform from time (tau) to frequency (omega).
     S(w) = 2 * Real [ integral_0^inf C(tau) * exp(i*w*tau) dtau ]
@@ -220,17 +220,3 @@ def fourier_transform_correlation(c_tau, t_grid, w_max=10.0, N_w=1000):
     
     return w_grid, S_w
 
-def calculate_response(dt, t_prime_idx, perturbed_mean_sx, reference_mean_sx, h_strength):
-    """
-    Calculates χ(t, t') = δ<Sx(t)> / δh(t')
-    """
-    # Difference in the average evolution
-    delta_sx = perturbed_mean_sx - reference_mean_sx
-    
-    # Response is the change divided by the perturbation strength
-    chi = delta_sx / (h_strength * dt)
-    
-    # Ensure causality: chi = 0 for t < t' using JAX's immutable update syntax
-    chi = chi.at[:t_prime_idx].set(0.0)
-    
-    return chi
