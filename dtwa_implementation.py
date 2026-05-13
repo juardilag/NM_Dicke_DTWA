@@ -7,6 +7,8 @@ import jax
 from initial_samplings import discrete_spin_sampling_factorized
 from tqdm import tqdm
 
+jax.config.update("jax_enable_x64", True)
+
 @jax.jit(static_argnames=['num_steps', 'N_w'])
 def compute_non_markovian_bath_functions(num_steps, dt, omega_0, alpha, omega_c, s, T, g, n_spins, w_max=20.0, N_w=5000):
     t_grid = jnp.arange(num_steps) * dt
@@ -46,28 +48,36 @@ def compute_non_markovian_bath_functions(num_steps, dt, omega_0, alpha, omega_c,
 
 @jax.jit(static_argnames=['num_steps', 'use_noise'])
 def generate_colored_noise(key, num_steps, dt, S_w, chi_R_t, dw, cos_wt, sin_wt, omega_0, g, n_photons_initial, n_spins, use_noise=True):
-    k_init_re, k_init_im, k_re, k_im = jax.random.split(key, 4)
+    # Split the grid to use only positive frequencies for noise generation
+    half_N = S_w.shape[0] // 2
+    w_pos = jnp.linspace(0, 20.0, half_N) # Positive frequencies
+    S_pos = S_w[half_N:] # S(w) is symmetric, take the positive side
     
-    # Noise amp from Power Spectrum [cite: 126]
-    amp = jnp.sqrt(S_w * dw / (2.0 * jnp.pi))
+    k_re, k_im = jax.random.split(key)
     
+    # Standard formula for colored noise from S(w): 
+    # Var = Integral[ S(w) dw / 2pi ]
+    # We use sqrt(2) because we only integrate over positive frequencies
+    amp = jnp.sqrt(S_pos * dw / jnp.pi) 
+    
+    # Regenerate time-frequency matrices for positive frequencies only
+    t_grid = jnp.arange(num_steps) * dt
+    wt_pos = t_grid[:, None] * w_pos[None, :]
+    
+    # Generate noise using independent Gaussian variables for phase and amplitude
+    noise_re = jax.random.normal(k_re, (half_N,))
+    noise_im = jax.random.normal(k_im, (half_N,))
+    
+    # This construction ensures the noise is real and matches the spectral density exactly
     bath_noise_t = jnp.where(use_noise, 
-                             jnp.dot(cos_wt, jax.random.normal(k_re, S_w.shape) * amp) + \
-                             jnp.dot(sin_wt, jax.random.normal(k_im, S_w.shape) * amp),
+                             jnp.dot(jnp.cos(wt_pos), noise_re * amp) + \
+                             jnp.dot(jnp.sin(wt_pos), noise_im * amp), 
                              0.0)
     
-    # Initial Wigner state of the Boson (Cavity) [cite: 124]
-    alpha_noise = jax.random.normal(k_init_re)*jnp.sqrt(0.5) + 1j*jax.random.normal(k_init_im)*jnp.sqrt(0.5)
-    alpha_0 = jnp.sqrt(n_photons_initial) + jnp.where(use_noise, alpha_noise, 0.0j)
-    
-    t_grid = jnp.arange(num_steps) * dt
-    norm = jnp.where(jnp.abs(chi_R_t[0]) > 1e-10, chi_R_t[0], 1.0)
-    
-    # Transient decay [cite: 67]
-    phi_transient = 2.0 * jnp.real(alpha_0 * jnp.exp(-1j*omega_0*t_grid) * (chi_R_t/norm))
-    phi_total = phi_transient + bath_noise_t
-    
-    xi_x = -(2.0 * g / jnp.sqrt(n_spins)) * phi_total
+    # Based on Eq. 34: B_noise = - (1/sqrt(2)) * xi
+    # Based on Eq. 126: <xi xi> = (8 g^2 / N) D_K
+    # This matches your 2.0 * g / sqrt(n_spins) scaling perfectly [cite: 126, 138]
+    xi_x = -(2.0 * g / jnp.sqrt(n_spins)) * bath_noise_t
     return jnp.zeros((num_steps, 3)).at[:, 0].set(xi_x)
 
 @jax.jit
@@ -176,47 +186,81 @@ def calculate_correlation(sx_trajectories):
 
 @jax.jit
 def extract_stationary_correlation(C_matrix):
-    """
-    Extracts C(tau) by aligning diagonals into columns and averaging.
-    This avoids the Tracer error by keeping shapes static.
-    """
     n = C_matrix.shape[0]
-    
-    # 1. Create an index grid for rows
     rows = jnp.arange(n)
     
-    # 2. Roll each row i by -i positions. 
-    # This moves the k-th diagonal element C[i, i+k] to the k-th column.
     def roll_row(i, row):
         return jnp.roll(row, -i)
-    
     aligned_matrix = jax.vmap(roll_row)(rows, C_matrix)
     
-    # 3. The first n//2 columns now contain the positive-lag diagonals.
-    # We take the mean over the rows for each column.
-    # Note: As lag increases, the number of valid (non-wrapped) elements decreases.
-    # For a simple stationary approximation, we take the mean of the first n//2 columns.
-    c_tau = jnp.mean(aligned_matrix[:, :n//2], axis=0)
+    # Calculate number of samples for each lag to unbias the estimator
+    lags = jnp.arange(n)
+    counts = n - lags
+    c_tau_sum = jnp.sum(aligned_matrix * (rows[:, None] + lags[None, :] < n), axis=0)
     
-    return c_tau
+    # FIX: Unbiased estimator prevents artificial damping of the tail
+    return c_tau_sum / jnp.where(counts > 0, counts, 1.0)
 
-@jax.jit(static_argnames=['N_w'])
-def fourier_transform_correlation(c_tau, t_grid, w_max=2.5, N_w=5000):
+@jax.jit
+def fourier_transform_correlation(c_tau, dt, w_grid):
     """
-    Performs a manual Riemann Fourier Transform from time (tau) to frequency (omega).
-    S(w) = 2 * Real [ integral_0^inf C(tau) * exp(i*w*tau) dtau ]
+    S(w) = 2 * Integral[ C(tau) * cos(w*tau) ] d_tau
     """
-    dt = t_grid[1] - t_grid[0]
     tau_grid = jnp.arange(len(c_tau)) * dt
-    w_grid = jnp.linspace(0, w_max, N_w)
-    
-    # Time-Frequency matrix for the transform
-    # Using the same Riemann structure as your compute_non_markovian_bath_functions
     w_tau = w_grid[:, None] * tau_grid[None, :]
-    kernel = jnp.cos(w_tau) + 1j * jnp.sin(w_tau)
     
-    # S(w) is the power spectrum of the fluctuations
-    S_w = 2.0 * jnp.real(jnp.dot(kernel, c_tau) * dt)
+    # Trapezoidal weights for Riemann sum: 0.5 at the boundaries
+    weights = jnp.ones_like(c_tau).at[0].set(0.5).at[-1].set(0.5)
     
-    return w_grid, S_w
+    # Standard 2.0 factor for double-sided power spectrum of real symmetric C(t)
+    S_w = 2.0 * jnp.dot(jnp.cos(w_tau), c_tau * weights) * dt
+    return S_w
 
+def measure_linear_response_fdt(keys, t_grid, p, t_pulse, epsilon=0.001):
+    dt = t_grid[1] - t_grid[0]
+    num_steps = t_grid.shape[0]
+    pulse_idx = jnp.searchsorted(t_grid, t_pulse)
+    j_val = p['n_spins'] / 2.0
+
+    # 1. Prepare Field Arrays
+    B_base = jnp.zeros((num_steps, 3)).at[:, 2].set(p['B_z'])
+    B_pert = B_base.at[pulse_idx, 0].add(epsilon / dt)
+
+    print(f">>> Propagating Base Ensemble (t_pulse={t_pulse})...")
+    res_base = run_integrated_twa_bundle(
+        keys, t_grid, p['omega_0'], p['alpha'], p['omega_c'], p['s'], p['T'], 
+        B_base, p['g'], p['n_photons_initial'], p['initial_direction'],
+        n_spins=p['n_spins']
+    )
+    
+    print(f">>> Propagating Perturbed Ensemble (Same Keys)...")
+    res_pert = run_integrated_twa_bundle(
+        keys, t_grid, p['omega_0'], p['alpha'], p['omega_c'], p['s'], p['T'], 
+        B_pert, p['g'], p['n_photons_initial'], p['initial_direction'],
+        n_spins=p['n_spins']
+    )
+
+    # 2. FIX: Divide by j_val to get intensive s_x = J_x / j
+    mean_sx_base = jnp.mean(res_base[:, :, 0], axis=0) / j_val
+    mean_sx_pert = jnp.mean(res_pert[:, :, 0], axis=0) / j_val
+    
+    # 3. FIX: Divide by physical field perturbation (0.5 * epsilon)
+    # This gives us exactly chi_sB (intensive susceptibility)
+    response = (mean_sx_pert - mean_sx_base) / epsilon
+
+    return response[pulse_idx:]
+
+@jax.jit
+def fourier_transform_response(chi_tau, dt, w_grid):
+    """
+    Im[chi(w)] = Integral[ chi(tau) * sin(w*tau) ] d_tau
+    """
+    tau_grid = jnp.arange(len(chi_tau)) * dt
+    w_tau = w_grid[:, None] * tau_grid[None, :]
+    
+    # Use identical Trapezoidal weights for consistency
+    weights = jnp.ones_like(chi_tau).at[0].set(0.5).at[-1].set(0.5)
+    
+    # No 2.0 here: the 2.0 in the FDT relation comes from the S(w) definition above
+    imag_chi_w = jnp.dot(jnp.sin(w_tau), chi_tau * weights) * dt
+    return imag_chi_w
