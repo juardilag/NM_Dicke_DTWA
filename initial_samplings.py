@@ -28,3 +28,16 @@ def discrete_spin_sampling_factorized(key, initial_direction, n_spins=1):
     s_init = (n_spins * mean_vec) + (f1 * perp1) + (f2 * perp2)
     
     return s_init
+
+def cavity_wigner_sampling(key, n_photons_initial):
+    """
+    Samples the initial complex cavity field amplitude from the Wigner distribution.
+    Adds quantum fluctuations with variance 1/2 to each quadrature.
+    """
+    k1, k2 = jax.random.split(key)
+    # Variance 0.5 per quadrature means std_dev = sqrt(0.5)
+    fluc_re = jax.random.normal(k1) * jnp.sqrt(0.5)
+    fluc_im = jax.random.normal(k2) * jnp.sqrt(0.5)
+    
+    alpha_0 = jnp.sqrt(jnp.array(n_photons_initial, dtype=jnp.float64))
+    return alpha_0 + fluc_re + 1j * fluc_im
