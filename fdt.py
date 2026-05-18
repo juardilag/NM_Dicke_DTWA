@@ -2,27 +2,34 @@ from dtwa_non_integrated import run_coupled_non_markovian_twa_bundle
 import jax.numpy as jnp
 import jax
 
-def calculate_correlation(traj_A, traj_B=None):
+def calculate_spin_correlation(sx_trajectories, j_val):
     """
-    Calculates the 2D correlation matrix C(t, t') = <\delta A(t) \delta B(t')>.
-    If traj_B is None, it automatically computes the auto-correlation of traj_A.
-    
-    Handles real arrays (spins) and complex arrays (cavity) natively.
+    Computes the intensive spin auto-correlation matrix.
+    Expects a 2D array `sx_trajectories` of shape (n_trajectories, n_steps).
     """
-    n_traj = traj_A.shape[0]
-    mean_A = jnp.mean(traj_A, axis=0)
-    fluctuations_A = traj_A - mean_A
+    n_traj = sx_trajectories.shape[0]
+    # Since sx_trajectories is already 2D, we scale it directly
+    sx_intensive = sx_trajectories / j_val
     
-    if traj_B is None:
-        fluctuations_B = fluctuations_A
-    else:
-        mean_B = jnp.mean(traj_B, axis=0)
-        fluctuations_B = traj_B - mean_B
-        
-    # Using .conj().T guarantees correct pairing for complex cavity fields.
-    # We slice out the real part to match symmetric FDT spectral assumptions.
-    C = jnp.real(fluctuations_A.T @ jnp.conj(fluctuations_B)) / n_traj
+    mean_sx = jnp.mean(sx_intensive, axis=0)
+    fluctuations = sx_intensive - mean_sx
+    
+    # Intensive correlation matrix
+    C = (fluctuations.T @ fluctuations) / n_traj
     return C
+
+def calculate_cavity_correlation(cav_trajectories, j_val):
+    """
+    Computes the intensive cavity auto-correlation matrix.
+    Expects a 2D complex array `cav_trajectories` of shape (n_trajectories, n_steps).
+    """
+    n_traj = cav_trajectories.shape[0]
+    mean_alpha = jnp.mean(cav_trajectories, axis=0)
+    fluctuations = cav_trajectories - mean_alpha
+    
+    # Real part of the symmetric complex product divided by j_val
+    C = jnp.real(fluctuations.T @ jnp.conj(fluctuations)) / n_traj
+    return C / j_val
 
 @jax.jit
 def extract_stationary_correlation(C_matrix):
@@ -50,19 +57,17 @@ def fourier_transform_correlation(c_tau, dt, w_grid):
 
 def measure_linear_response_fdt(keys, t_grid, p, t_pulse, epsilon=0.001, w_max=20.0, N_w=5000):
     """
-    Measures the linear response of both the spin vector and the cavity field 
-    following a sudden magnetic field perturbation pulse applied to the spin.
+    Measures the synchronized intensive linear response profiles for both subsystems.
     """
     dt = t_grid[1] - t_grid[0]
     num_steps = t_grid.shape[0]
     pulse_idx = jnp.searchsorted(t_grid, t_pulse)
     j_val = p['n_spins'] / 2.0
 
-    # 1. Prepare Base and Perturbed Magnetic Field Profile Arrays
     B_base = jnp.zeros((num_steps, 3)).at[:, 2].set(p['B_z'])
     B_pert = B_base.at[pulse_idx, 0].add(epsilon / dt)
 
-    print(f">>> Propagating Base Coupled Ensemble (t_pulse={t_pulse})...")
+    print(f">>> Propagating Base Coupled Ensemble...")
     res_base_S, res_base_alpha = run_coupled_non_markovian_twa_bundle(
         keys=keys, t_grid=t_grid, omega_0=p['omega_0'], alpha=p['alpha'],
         omega_c=p['omega_c'], s=p['s'], T=p['T'], B_field=B_base,
@@ -71,7 +76,7 @@ def measure_linear_response_fdt(keys, t_grid, p, t_pulse, epsilon=0.001, w_max=2
         n_spins=p['n_spins'], w_max=w_max, N_w=N_w, use_noise=True, use_sampling=True
     )
     
-    print(f">>> Propagating Perturbed Coupled Ensemble (Same Keys)...")
+    print(f">>> Propagating Perturbed Coupled Ensemble...")
     res_pert_S, res_pert_alpha = run_coupled_non_markovian_twa_bundle(
         keys=keys, t_grid=t_grid, omega_0=p['omega_0'], alpha=p['alpha'],
         omega_c=p['omega_c'], s=p['s'], T=p['T'], B_field=B_pert,
@@ -80,14 +85,14 @@ def measure_linear_response_fdt(keys, t_grid, p, t_pulse, epsilon=0.001, w_max=2
         n_spins=p['n_spins'], w_max=w_max, N_w=N_w, use_noise=True, use_sampling=True
     )
 
-    # 2. Extract Intensive Spin Response Profile (\chi_xx)
+    # Intensive Spin Response (Divided by j_val)
     mean_sx_base = jnp.mean(res_base_S[:, :, 0], axis=0) / j_val
     mean_sx_pert = jnp.mean(res_pert_S[:, :, 0], axis=0) / j_val
     spin_response = (mean_sx_pert - mean_sx_base) / epsilon
     
-    # 3. Extract Cavity Real Quadrature Response Profile (\chi_{\alpha x})
-    mean_cx_base = jnp.mean(jnp.real(res_base_alpha), axis=0)
-    mean_cx_pert = jnp.mean(jnp.real(res_pert_alpha), axis=0)
+    # Intensive Cavity Response (Divided by sqrt(j_val))
+    mean_cx_base = jnp.mean(jnp.real(res_base_alpha), axis=0) / jnp.sqrt(j_val)
+    mean_cx_pert = jnp.mean(jnp.real(res_pert_alpha), axis=0) / jnp.sqrt(j_val)
     cavity_response = (mean_cx_pert - mean_cx_base) / epsilon
 
     return {
