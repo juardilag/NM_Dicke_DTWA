@@ -55,50 +55,56 @@ def fourier_transform_correlation(c_tau, dt, w_grid):
     S_w = 2.0 * jnp.dot(jnp.cos(w_tau), c_tau * weights) * dt
     return S_w
 
-def measure_linear_response_fdt(keys, t_grid, p, t_pulse, epsilon=0.001, w_max=20.0, N_w=5000):
+def measure_linear_response_fdt(keys, t_grid, p, t_pulse, target="spin", epsilon=0.01, w_max=20.0, N_w=5000):
     """
-    Measures the synchronized intensive linear response profiles for both subsystems.
+    Measures the true auto-susceptibility of either the spin or the cavity system.
+    target="spin"   -> Kicks spins with B_x, measures spin response.
+    target="cavity" -> Kicks cavity with E-field, measures cavity quadrature response.
     """
     dt = t_grid[1] - t_grid[0]
     num_steps = t_grid.shape[0]
     pulse_idx = jnp.searchsorted(t_grid, t_pulse)
     j_val = p['n_spins'] / 2.0
 
+    # Base arrays (No perturbations)
     B_base = jnp.zeros((num_steps, 3)).at[:, 2].set(p['B_z'])
-    B_pert = B_base.at[pulse_idx, 0].add(epsilon / dt)
+    E_base = jnp.zeros(num_steps)
 
-    print(f">>> Propagating Base Coupled Ensemble...")
+    if target == "spin":
+        B_pert = B_base.at[pulse_idx, 0].add(epsilon / dt)
+        E_pert = E_base
+    elif target == "cavity":
+        B_pert = B_base
+        E_pert = E_base.at[pulse_idx].add(epsilon / dt)
+
+    print(f">>> Propagating Base Ensemble...")
     res_base_S, res_base_alpha = run_coupled_non_markovian_twa_bundle(
         keys=keys, t_grid=t_grid, omega_0=p['omega_0'], alpha=p['alpha'],
         omega_c=p['omega_c'], s=p['s'], T=p['T'], B_field=B_base,
         g=p['g'], n_photons_initial=p['n_photons_initial'],
         initial_direction=p['initial_direction'], batch_size=p['batch_size'],
-        n_spins=p['n_spins'], w_max=w_max, N_w=N_w, use_noise=True, use_sampling=True
+        n_spins=p['n_spins'], w_max=w_max, N_w=N_w, cavity_drive=E_base
     )
     
-    print(f">>> Propagating Perturbed Coupled Ensemble...")
+    print(f">>> Propagating Perturbed Ensemble (Targeting {target})...")
     res_pert_S, res_pert_alpha = run_coupled_non_markovian_twa_bundle(
         keys=keys, t_grid=t_grid, omega_0=p['omega_0'], alpha=p['alpha'],
         omega_c=p['omega_c'], s=p['s'], T=p['T'], B_field=B_pert,
         g=p['g'], n_photons_initial=p['n_photons_initial'],
         initial_direction=p['initial_direction'], batch_size=p['batch_size'],
-        n_spins=p['n_spins'], w_max=w_max, N_w=N_w, use_noise=True, use_sampling=True
+        n_spins=p['n_spins'], w_max=w_max, N_w=N_w, cavity_drive=E_pert
     )
 
-    # Intensive Spin Response (Divided by j_val)
-    mean_sx_base = jnp.mean(res_base_S[:, :, 0], axis=0) / j_val
-    mean_sx_pert = jnp.mean(res_pert_S[:, :, 0], axis=0) / j_val
-    spin_response = (mean_sx_pert - mean_sx_base) / epsilon
-    
-    # Intensive Cavity Response (Divided by sqrt(j_val))
-    mean_cx_base = jnp.mean(jnp.real(res_base_alpha), axis=0) / jnp.sqrt(j_val)
-    mean_cx_pert = jnp.mean(jnp.real(res_pert_alpha), axis=0) / jnp.sqrt(j_val)
-    cavity_response = (mean_cx_pert - mean_cx_base) / epsilon
+    if target == "spin":
+        mean_base = jnp.mean(res_base_S[:, :, 0], axis=0) / j_val
+        mean_pert = jnp.mean(res_pert_S[:, :, 0], axis=0) / j_val
+    elif target == "cavity":
+        # Divide by sqrt(j_val) to match intensive fluctuation scales perfectly
+        mean_base = jnp.mean(jnp.real(res_base_alpha), axis=0) / jnp.sqrt(j_val)
+        mean_pert = jnp.mean(jnp.real(res_pert_alpha), axis=0) / jnp.sqrt(j_val)
 
-    return {
-        "spin": spin_response[pulse_idx:],
-        "cavity": cavity_response[pulse_idx:]
-    }
+    response = (mean_pert - mean_base) / epsilon
+    return response[pulse_idx:]
 
 @jax.jit
 def fourier_transform_response(chi_tau, dt, w_grid):
