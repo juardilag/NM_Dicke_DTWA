@@ -126,7 +126,7 @@ def non_markovian_coupled_etd_step(S_history, alpha_history, step_idx, noise_tra
 
 
 def run_coupled_non_markovian_twa_bundle(keys, t_grid, omega_0, alpha, omega_c, s, T, B_field, g, n_photons_initial, initial_direction, 
-                                         batch_size=1000, n_spins=1, w_max=20.0, N_w=5000, use_noise=True, use_sampling=True):
+                                         batch_size=1000, n_spins=1, w_max=20.0, N_w=5000, use_noise=True, use_sampling=True, cavity_drive=None):
     dt = t_grid[1] - t_grid[0]
     num_steps = t_grid.shape[0]
     n_total = keys.shape[0]
@@ -134,10 +134,13 @@ def run_coupled_non_markovian_twa_bundle(keys, t_grid, omega_0, alpha, omega_c, 
     Sigma_R_t, S_bath_w, w_grid, dw = compute_explicit_bath_kernels(
         num_steps, dt, omega_0, alpha, omega_c, s, T, w_max, N_w)
 
+    # Initialize an empty drive array if none is provided to keep JAX operations smooth
+    if cavity_drive is None:
+        cavity_drive = jnp.zeros(num_steps)
+
     def solve_single_trajectory(key):
         k_samp_spin, k_samp_alpha, k_noise = jax.random.split(key, 3)
         
-        # Exact 1:1 initial normalization matching your working integrated code
         s0_sampled = discrete_spin_sampling_factorized(k_samp_spin, initial_direction, n_spins) / 2.0
         s0_mean = (initial_direction * n_spins) / 2.0
         s0 = jnp.where(use_sampling, s0_sampled, s0_mean)
@@ -154,10 +157,19 @@ def run_coupled_non_markovian_twa_bundle(keys, t_grid, omega_0, alpha, omega_c, 
         
         def scan_body(carry, step_idx):
             S_hist, alpha_hist = carry
-            B_val = B_field[step_idx - 1]
+            B_val = B_field[step_idx] 
             
+            # --- EXTRACT THE EXTERNAL PROBE DRIVE VAL ---
+            E_val = cavity_drive[step_idx - 1]
+            
+            # We add -1j * E_val to the drive parameters passed downstream
             S_next_hist, alpha_next_hist = non_markovian_coupled_etd_step(
                 S_hist, alpha_hist, step_idx, noise_traj, Sigma_R_t, B_val, g, omega_0, n_spins, dt, num_steps)
+            
+            # Directly add the exact linear ETD impulse contribution of the probe to alpha
+            z = 1j * omega_0
+            phi_drive = (1.0 - jnp.exp(-z * dt)) / z
+            alpha_next_hist = alpha_next_hist.at[step_idx].add(-1j * E_val * phi_drive)
             
             return (S_next_hist, alpha_next_hist), None
 
@@ -172,11 +184,8 @@ def run_coupled_non_markovian_twa_bundle(keys, t_grid, omega_0, alpha, omega_c, 
 
     all_S, all_alpha = [], []
     n_batches = int(jnp.ceil(n_total / batch_size))
-    mode_name = "TWA" if use_noise else "Mean-Field"
     
-    print(f"Starting Explicit Coupled Non-Markovian {mode_name}: {n_total} trajectories in {n_batches} batches.")
-    
-    for i in tqdm(range(n_batches), desc="Non-Markovian Batches"):
+    for i in range(n_batches):
         start_idx = i * batch_size
         end_idx = min((i + 1) * batch_size, n_total)
         current_keys = keys[start_idx:end_idx]
