@@ -43,6 +43,11 @@ def compute_explicit_bath_kernels(num_steps, dt, omega_0, alpha, omega_c, s, T, 
 
 @jax.jit(static_argnames=['num_steps'])
 def generate_explicit_bath_noise(key, num_steps, dt, S_bath_w, w_grid, dw, use_noise=True):
+    """
+    Generates a strictly REAL-VALUED stochastic magnetic field trajectory.
+    Aligns perfectly with the real semiclassical field operator coupling derived
+    in the Keldysh action notes.
+    """
     half_N = S_bath_w.shape[0] // 2
     w_pos = jnp.linspace(0.0, 20.0, half_N, dtype=jnp.float64)
     S_pos = S_bath_w[half_N:]
@@ -56,11 +61,13 @@ def generate_explicit_bath_noise(key, num_steps, dt, S_bath_w, w_grid, dw, use_n
     noise_re = jax.random.normal(k_re, (half_N,), dtype=jnp.float64)
     noise_im = jax.random.normal(k_im, (half_N,), dtype=jnp.float64)
     
-    xi_t = jnp.where(use_noise, 
-                     jnp.dot(jnp.cos(wt_pos), noise_re * amp) + \
-                     1j * jnp.dot(jnp.sin(wt_pos), noise_im * amp), 
-                     0.0 + 0j)
-    return xi_t
+    # CRITICAL FIX: Combine modes to project a strictly real stochastic path
+    # into the physical x-axis torque equation.
+    xi_t_real = jnp.where(use_noise, 
+                          jnp.dot(jnp.cos(wt_pos), noise_re * amp) - \
+                          jnp.dot(jnp.sin(wt_pos), noise_im * amp), 
+                          0.0)
+    return xi_t_real
 
 
 @jax.jit(static_argnames=['num_steps'])
@@ -124,10 +131,6 @@ def non_markovian_coupled_etd_step(S_history, alpha_history, step_idx, noise_tra
 def solve_single_trajectory(key, t_grid, omega_0, B_field, g, n_photons_initial, initial_direction, 
                              n_spins, dt, num_steps, Sigma_R_t, S_bath_w, w_grid, dw, 
                              use_noise, use_sampling, cavity_drive):
-    """
-    Unified trajectory solver. Fixed tracing bugs by using native JAX dynamic 
-    index lookup functions instead of Python indices.
-    """
     k_samp_spin, k_samp_alpha, k_noise = jax.random.split(key, 3)
     coupling_strength = g / jnp.sqrt(n_spins)
     
@@ -142,20 +145,21 @@ def solve_single_trajectory(key, t_grid, omega_0, B_field, g, n_photons_initial,
     S_history = jnp.zeros((num_steps, 3), dtype=jnp.float64).at[0].set(s0)
     alpha_history = jnp.zeros((num_steps,), dtype=jnp.complex128).at[0].set(alpha0)
     
-    noise_traj = generate_explicit_bath_noise(k_noise, num_steps, dt, S_bath_w, w_grid, dw, use_noise=use_noise)
+    noise_traj_real = generate_explicit_bath_noise(k_noise, num_steps, dt, S_bath_w, w_grid, dw, use_noise=use_noise)
+    noise_traj_complex = noise_traj_real + 0j
     
     def scan_body(carry, step_idx):
         S_hist, alpha_hist = carry
         
-        # FIX: Safe dynamic tracing indexing via dynamic_index_in_dim
         B_val = jax.lax.dynamic_index_in_dim(B_field, step_idx, axis=0, keepdims=False)
-        E_val = jax.lax.dynamic_index_in_dim(cavity_drive, step_idx, axis=0, keepdims=False)
+        E_val = jax.lax.dynamic_index_in_dim(cavity_drive, step_idx - 1, axis=0, keepdims=False)
         
         S_next_hist, alpha_next_hist = non_markovian_coupled_etd_step(
-            S_hist, alpha_hist, step_idx, noise_traj, Sigma_R_t, B_val, 
+            S_hist, alpha_hist, step_idx, noise_traj_complex, Sigma_R_t, B_val, 
             coupling_strength, omega_0, dt, num_steps
         )
         
+        # Exact ETD impulse injection
         z = 1j * omega_0
         phi_drive = (1.0 - jnp.exp(-z * dt)) / z
         alpha_next_hist = alpha_next_hist.at[step_idx].add(-1j * E_val * phi_drive)
