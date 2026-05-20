@@ -125,8 +125,8 @@ def solve_single_trajectory(key, t_grid, omega_0, B_field, g, n_photons_initial,
                              n_spins, dt, num_steps, Sigma_R_t, S_bath_w, w_grid, dw, 
                              use_noise, use_sampling, cavity_drive):
     """
-    Extracted completely out of the bundle function scope to ensure permanent 
-    compilation without tracing overhead hits when runtime values shift.
+    Unified trajectory solver. Fixed tracing bugs by using native JAX dynamic 
+    index lookup functions instead of Python indices.
     """
     k_samp_spin, k_samp_alpha, k_noise = jax.random.split(key, 3)
     coupling_strength = g / jnp.sqrt(n_spins)
@@ -142,17 +142,19 @@ def solve_single_trajectory(key, t_grid, omega_0, B_field, g, n_photons_initial,
     S_history = jnp.zeros((num_steps, 3), dtype=jnp.float64).at[0].set(s0)
     alpha_history = jnp.zeros((num_steps,), dtype=jnp.complex128).at[0].set(alpha0)
     
-    noise_traj = generate_explicit_bath_noise(
-        k_noise, num_steps, dt, S_bath_w, w_grid, dw, use_noise=use_noise)
+    noise_traj = generate_explicit_bath_noise(k_noise, num_steps, dt, S_bath_w, w_grid, dw, use_noise=use_noise)
     
     def scan_body(carry, step_idx):
         S_hist, alpha_hist = carry
-        B_val = B_field[step_idx] 
-        E_val = cavity_drive[step_idx - 1]
+        
+        # FIX: Safe dynamic tracing indexing via dynamic_index_in_dim
+        B_val = jax.lax.dynamic_index_in_dim(B_field, step_idx, axis=0, keepdims=False)
+        E_val = jax.lax.dynamic_index_in_dim(cavity_drive, step_idx, axis=0, keepdims=False)
         
         S_next_hist, alpha_next_hist = non_markovian_coupled_etd_step(
             S_hist, alpha_hist, step_idx, noise_traj, Sigma_R_t, B_val, 
-            coupling_strength, omega_0, dt, num_steps)
+            coupling_strength, omega_0, dt, num_steps
+        )
         
         z = 1j * omega_0
         phi_drive = (1.0 - jnp.exp(-z * dt)) / z
@@ -161,7 +163,8 @@ def solve_single_trajectory(key, t_grid, omega_0, B_field, g, n_photons_initial,
         return (S_next_hist, alpha_next_hist), None
 
     init_carry = (S_history, alpha_history)
-    (final_S_history, final_alpha_history), _ = jax.lax.scan(scan_body, init_carry, jnp.arange(1, num_steps, dtype=jnp.int64))
+    time_indices = jnp.arange(1, num_steps, dtype=jnp.int64)
+    (final_S_history, final_alpha_history), _ = jax.lax.scan(scan_body, init_carry, time_indices)
     
     return final_S_history, final_alpha_history
 
