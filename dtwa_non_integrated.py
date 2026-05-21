@@ -7,8 +7,6 @@ os.environ["JAX_LOG_LEVEL"] = "error"
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tqdm import tqdm
-import jax.debug
 from initial_samplings import discrete_spin_sampling_factorized, cavity_wigner_sampling
 
 # =====================================================================
@@ -153,7 +151,8 @@ def non_markovian_coupled_etd_step(S_history, alpha_history, step_idx, noise_tra
 
 def solve_single_trajectory(key, omega_0, B_field, g, n_photons_initial, initial_direction, 
                             n_spins, dt, num_steps, Sigma_matrix_weighted, cos_wt, sin_wt, amp, 
-                            use_noise, use_sampling, cavity_drive):
+                            use_noise, use_sampling, cavity_drive, pulse_idx=-1, epsilon_spin=0.0, epsilon_cav=0.0):
+    
     k_samp_spin, k_samp_alpha, k_noise = jax.random.split(key, 3)
     coupling_strength = g / jnp.sqrt(n_spins)
     
@@ -168,25 +167,52 @@ def solve_single_trajectory(key, omega_0, B_field, g, n_photons_initial, initial
     S_history = jnp.zeros((num_steps, 3), dtype=jnp.float64).at[0].set(s0)
     alpha_history = jnp.zeros((num_steps,), dtype=jnp.complex128).at[0].set(alpha0)
     
-    # Fast constant-matrix noise injection
     noise_traj_real = generate_explicit_bath_noise(k_noise, cos_wt, sin_wt, amp, use_noise=use_noise)
     noise_traj_complex = noise_traj_real + 0j
     
     def scan_body(carry, step_idx):
         S_hist, alpha_hist = carry
-        B_val = jax.lax.dynamic_index_in_dim(B_field, step_idx, axis=0, keepdims=False)
-        E_val = jax.lax.dynamic_index_in_dim(cavity_drive, step_idx - 1, axis=0, keepdims=False)
+        curr_idx = step_idx - 1
         
-        S_next_hist, alpha_next_hist = non_markovian_coupled_etd_step(
-            S_hist, alpha_hist, step_idx, noise_traj_complex, Sigma_matrix_weighted, B_val, 
-            coupling_strength, omega_0, dt
+        # 1. Dynamically slice arrays at the exact time step
+        B_val_step = jax.lax.dynamic_index_in_dim(B_field, curr_idx, axis=0, keepdims=False)
+        E_val_step = jax.lax.dynamic_index_in_dim(cavity_drive, curr_idx, axis=0, keepdims=False)
+        
+        # 2. Standard Unperturbed Evolution
+        # CAUGHT THE BUG: This returns the FULL (5000, 3) updated history arrays!
+        S_hist_updated, alpha_hist_updated = non_markovian_coupled_etd_step(
+            S_hist, alpha_hist, step_idx, noise_traj_complex, Sigma_matrix_weighted, 
+            B_val_step, coupling_strength, omega_0, dt
         )
         
+        # Extract strictly the 1D vectors for the current step
+        current_S = S_hist_updated[step_idx]
+        current_alpha = alpha_hist_updated[step_idx]
+        
+        # Apply standard continuous cavity drive (if any)
         z = 1j * omega_0
         phi_drive = (1.0 - jnp.exp(-z * dt)) / z
-        alpha_next_hist = alpha_next_hist.at[step_idx].add(-1j * E_val * phi_drive)
+        current_alpha = current_alpha - 1j * E_val_step * phi_drive
         
-        return (S_next_hist, alpha_next_hist), None
+        # 3. The EXACT Instantaneous Dirac Kicks (Only triggers at pulse_idx)
+        is_pulse = (step_idx == pulse_idx)
+        
+        cos_e, sin_e = jnp.cos(epsilon_spin), jnp.sin(epsilon_spin)
+        S_kicked = jnp.array([
+            current_S[0],
+            current_S[1] * cos_e - current_S[2] * sin_e,
+            current_S[2] * cos_e + current_S[1] * sin_e
+        ], dtype=jnp.float64)
+        
+        # Snap the 1D vectors if pulse is triggered
+        final_S_step = jnp.where(is_pulse, S_kicked, current_S)
+        final_alpha_step = jnp.where(is_pulse, current_alpha - 1j * epsilon_cav, current_alpha)
+        
+        # Safely overwrite the history matrix with the finalized step
+        S_hist_final = S_hist_updated.at[step_idx].set(final_S_step)
+        alpha_hist_final = alpha_hist_updated.at[step_idx].set(final_alpha_step)
+        
+        return (S_hist_final, alpha_hist_final), None
 
     init_carry = (S_history, alpha_history)
     time_indices = jnp.arange(1, num_steps, dtype=jnp.int64)
@@ -214,18 +240,27 @@ def _accumulate_batch_sums(spin_ensemble, cavity_ensemble, j_val):
         "sum_psi_sq": jnp.sum(jnp.abs(cavity_ensemble)**2, axis=0)
     }
 
+
 @jax.jit(static_argnames=['n_spins', 'num_steps', 'use_noise', 'use_sampling'])
-def _compiled_master_processor(batched_keys, omega_0, B_field, g, n_photons_initial, initial_direction, 
+def _compiled_master_processor(batched_keys, omega_0, B_field_safe, g, n_photons_initial, initial_direction, 
                                n_spins, dt, num_steps, Sigma_matrix_weighted, cos_wt, sin_wt, amp, 
                                use_noise, use_sampling, cavity_drive):
+    
     j_val = n_spins / 2.0
+    
+    # Safe vmap wrapping ensuring exactly 19 arguments
+    vmap_solver = jax.vmap(
+        solve_single_trajectory, 
+        in_axes=(0, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
+    )
 
     def master_scan_body(carry_stats, current_batch_keys):
-        batch_S, batch_alpha = jax.vmap(lambda k: solve_single_trajectory(
-            k, omega_0, B_field, g, n_photons_initial, initial_direction, 
+        # Pass normal physics triggers (-1 for pulse_idx and 0.0 for kicks)
+        batch_S, batch_alpha = vmap_solver(
+            current_batch_keys, omega_0, B_field_safe, g, n_photons_initial, initial_direction, 
             n_spins, dt, num_steps, Sigma_matrix_weighted, cos_wt, sin_wt, amp, 
-            use_noise, use_sampling, cavity_drive
-        ))(current_batch_keys)
+            use_noise, use_sampling, cavity_drive, -1, 0.0, 0.0
+        )
         
         batch_sums = _accumulate_batch_sums(batch_S, batch_alpha, j_val)
         next_carry = {key: carry_stats[key] + batch_sums[key] for key in carry_stats}
@@ -247,15 +282,27 @@ def _compiled_master_processor(batched_keys, omega_0, B_field, g, n_photons_init
 
 def run_dtwa(keys, t_grid, omega_0, alpha, omega_c, s, T, B_field, g, n_photons_initial, initial_direction, 
              batch_size=1000, n_spins=1, w_max=20.0, N_w=5000, use_noise=True, use_sampling=True, cavity_drive=None):
+    
     dt = t_grid[1] - t_grid[0]
     num_steps = t_grid.shape[0]
     n_total = keys.shape[0]
     
-    # 1. Base Kernel Extraction
+    # --- CRITICAL NEW SANITIZER: GUARANTEES CORRECT B_FIELD SHAPES ---
+    B_arr = jnp.asarray(B_field)
+    if B_arr.ndim == 0:
+        # If user passed a single scalar number (B_z)
+        B_field_safe = jnp.zeros((num_steps, 3)).at[:, 2].set(B_arr)
+    elif B_arr.shape == (3,):
+        # If user passed a constant vector [0.0, 0.0, B_z]
+        B_field_safe = jnp.tile(B_arr, (num_steps, 1))
+    else:
+        # Strip any accidental batch dimensions and force to (num_steps, 3)
+        B_field_safe = jnp.reshape(B_arr, (num_steps, 3))
+    # -----------------------------------------------------------------
+    
     Sigma_R_t, S_bath_w, w_grid, dw = compute_explicit_bath_kernels(
         num_steps, dt, omega_0, alpha, omega_c, s, T, w_max, N_w)
 
-    # 2. Hoist Costly Calculations Out of Loops
     Sigma_matrix_weighted, cos_wt, sin_wt, amp = precompute_solver_matrices(
         num_steps, dt, Sigma_R_t, S_bath_w, dw)
 
@@ -267,9 +314,8 @@ def run_dtwa(keys, t_grid, omega_0, alpha, omega_c, s, T, B_field, g, n_photons_
 
     print(f"Executing {n_total} trajectories across {n_batches} compiled batches...")
     
-    # 3. Fire Compiled Loop
     running_stats = _compiled_master_processor(
-        batched_keys, omega_0, B_field, g, n_photons_initial, initial_direction, 
+        batched_keys, omega_0, B_field_safe, g, n_photons_initial, initial_direction, 
         n_spins, dt, num_steps, Sigma_matrix_weighted, cos_wt, sin_wt, amp, 
         use_noise, use_sampling, cavity_drive
     )
