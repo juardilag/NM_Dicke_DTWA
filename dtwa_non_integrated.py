@@ -6,8 +6,8 @@ os.environ["JAX_LOG_LEVEL"] = "error"
 
 import jax
 import jax.numpy as jnp
-from tqdm import tqdm
 import numpy as np
+from tqdm import tqdm
 import jax.debug
 from initial_samplings import discrete_spin_sampling_factorized, cavity_wigner_sampling
 
@@ -192,86 +192,87 @@ def _accumulate_batch_sums(spin_ensemble, cavity_ensemble, j_val):
     }
 
 
+@jax.jit(static_argnames=['n_spins', 'num_steps', 'use_noise', 'use_sampling'])
+def _compiled_master_processor(batched_keys, t_grid, omega_0, B_field, g, n_photons_initial, 
+                               initial_direction, n_spins, dt, num_steps, Sigma_R_t, S_bath_w, 
+                               w_grid, dw, use_noise, use_sampling, cavity_drive):
+    
+    j_val = n_spins / 2.0
+
+    def master_scan_body(carry_stats, current_batch_keys):
+        # 1. Run the vectorized trajectory solver for the batch
+        batch_S, batch_alpha = jax.vmap(lambda k: solve_single_trajectory(
+            k, t_grid, omega_0, B_field, g, n_photons_initial, initial_direction, 
+            n_spins, dt, num_steps, Sigma_R_t, S_bath_w, w_grid, dw, 
+            use_noise, use_sampling, cavity_drive
+        ))(current_batch_keys)
+        
+        # 2. Reduce the batch
+        batch_sums = _accumulate_batch_sums(batch_S, batch_alpha, j_val)
+        
+        # 3. Add to the running totals
+        next_carry = {key: carry_stats[key] + batch_sums[key] for key in carry_stats}
+        
+        return next_carry, None
+
+    # Initialize empty statistics natively on the device
+    init_stats = {
+        "sum_jx": jnp.zeros(num_steps, dtype=jnp.float64),
+        "sum_jy": jnp.zeros(num_steps, dtype=jnp.float64),
+        "sum_jz": jnp.zeros(num_steps, dtype=jnp.float64),
+        "sum_jx_sq": jnp.zeros(num_steps, dtype=jnp.float64),
+        "sum_abs_jx": jnp.zeros(num_steps, dtype=jnp.float64),
+        "sum_psi": jnp.zeros(num_steps, dtype=jnp.complex128),
+        "sum_psi_sq": jnp.zeros(num_steps, dtype=jnp.float64)
+    }
+    
+    # Run the native XLA loop over the batches dimension
+    final_running_stats, _ = jax.lax.scan(master_scan_body, init_stats, batched_keys)
+    return final_running_stats
+
+
 def run_dtwa(keys, t_grid, omega_0, alpha, omega_c, s, T, B_field, g, n_photons_initial, initial_direction, 
-                                          batch_size=1000, n_spins=1, w_max=20.0, N_w=5000, use_noise=True, use_sampling=True, cavity_drive=None):
+             batch_size=1000, n_spins=1, w_max=20.0, N_w=5000, use_noise=True, use_sampling=True, cavity_drive=None):
     """
-    Runs trajectories in batches, immediately reducing them to statistical summaries.
-    Guarantees flat O(1) memory usage relative to total trajectory count.
+    Lightweight CPU wrapper that prepares the memory grid and calls the compiled GPU core.
     """
     dt = t_grid[1] - t_grid[0]
     num_steps = t_grid.shape[0]
     n_total = keys.shape[0]
     
+    # 1. Pre-compute memory kernels
     Sigma_R_t, S_bath_w, w_grid, dw = compute_explicit_bath_kernels(
         num_steps, dt, omega_0, alpha, omega_c, s, T, w_max, N_w)
 
     if cavity_drive is None:
         cavity_drive = jnp.zeros(num_steps, dtype=jnp.float64)
 
-    n_batches = int(jnp.ceil(n_total / batch_size))
-    pbar = tqdm(total=n_batches, desc=f"Running DTWA of {n_total} trajectories in {n_batches} batches")
+    # 2. Prepare the strict 2D key grid (n_batches, batch_size, 2)
+    n_batches = n_total // batch_size
+    batched_keys = keys[:n_batches * batch_size].reshape(n_batches, batch_size, -1)
 
-    # 2. Modern callback functions do not take hidden transformation arguments
-    def update_pbar():
-        pbar.update(1)
-
-    @jax.jit
-    def process_and_reduce_batch(batch_keys):
-        # 1. Run trajectories for this batch
-        batch_S, batch_alpha = jax.vmap(lambda k: solve_single_trajectory(
-            k, t_grid, omega_0, B_field, g, n_photons_initial, initial_direction, 
-            n_spins, dt, num_steps, Sigma_R_t, S_bath_w, w_grid, dw, 
-            use_noise, use_sampling, cavity_drive
-        ))(batch_keys)
-        
-        # 2. Immediately reduce batch to 1D statistical components
-        batch_sums = _accumulate_batch_sums(batch_S, batch_alpha, n_spins)
-        
-        # 3. Use the modern debug callback to trigger the progress bar tick
-        jax.debug.callback(update_pbar)
-        return batch_sums
-
-    # Initialize empty tracking arrays on Host CPU RAM to hold cumulative statistics
-    running_stats = {
-        "sum_jx": np.zeros(num_steps, dtype=np.float64),
-        "sum_jy": np.zeros(num_steps, dtype=np.float64),
-        "sum_jz": np.zeros(num_steps, dtype=np.float64),
-        "sum_jx_sq": np.zeros(num_steps, dtype=np.float64),
-        "sum_abs_jx": np.zeros(num_steps, dtype=np.float64),
-        "sum_psi": np.zeros(num_steps, dtype=np.complex128),
-        "sum_psi_sq": np.zeros(num_steps, dtype=np.float64)
-    }
+    print(f"Executing {n_total} trajectories across {n_batches} compiled batches...")
     
-    try:
-        for i in range(n_batches):
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, n_total)
-            current_keys = keys[start_idx:end_idx]
-            
-            # Compute current batch reductions on device
-            batch_sums = process_and_reduce_batch(current_keys)
-            
-            # Pull down the tiny 1D arrays to CPU and accumulate immediately
-            for key in running_stats:
-                batch_sums[key].block_until_ready()
-                running_stats[key] += np.array(batch_sums[key])
-                
-    finally:
-        pbar.close()
+    # 3. Fire the compiled master loop
+    running_stats = _compiled_master_processor(
+        batched_keys, t_grid, omega_0, B_field, g, n_photons_initial, initial_direction, 
+        n_spins, dt, num_steps, Sigma_R_t, S_bath_w, w_grid, dw, use_noise, use_sampling, cavity_drive
+    )
 
-    # Final normalization step over the entire global ensemble size (n_total)
+    # 4. Calculate final averages natively
     final_stats = {
         "j_x": running_stats["sum_jx"] / n_total,
         "j_y": running_stats["sum_jy"] / n_total,
         "j_z": running_stats["sum_jz"] / n_total,
-        "rms_jx": np.sqrt(running_stats["sum_jx_sq"] / n_total),
+        "rms_jx": jnp.sqrt(running_stats["sum_jx_sq"] / n_total),
         "abs_jx": running_stats["sum_abs_jx"] / n_total,
         "mean_psi": running_stats["sum_psi"] / n_total,
-        "abs_mean_psi": np.abs(running_stats["sum_psi"] / n_total),
+        "abs_mean_psi": jnp.abs(running_stats["sum_psi"] / n_total),
         "mean_photon_number": (running_stats["sum_psi_sq"] / n_total) - 0.5
     }
     
-    # Clean up device compilation memory
-    jax.clear_caches()
-    
-    return final_stats
+    # 5. Clean hand-off to CPU
+    final_stats_cpu = {key: np.array(value) for key, value in final_stats.items()}
+
+    print("Simulation Complete!")
+    return final_stats_cpu
