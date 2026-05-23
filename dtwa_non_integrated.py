@@ -151,8 +151,11 @@ def non_markovian_coupled_etd_step(S_history, alpha_history, step_idx, noise_tra
 
 def solve_single_trajectory(key, omega_0, B_field, g, n_photons_initial, initial_direction, 
                             n_spins, dt, num_steps, Sigma_matrix_weighted, cos_wt, sin_wt, amp, 
-                            use_noise, use_sampling, cavity_drive, pulse_idx=-1, epsilon_spin=0.0, epsilon_cav=0.0):
-    
+                            use_noise, use_sampling, cavity_drive):
+    """
+    Removed all manual jump/kick logic. The pulse is now handled smoothly 
+    by the ETD solver integrating the B_field and cavity_drive forces.
+    """
     k_samp_spin, k_samp_alpha, k_noise = jax.random.split(key, 3)
     coupling_strength = g / jnp.sqrt(n_spins)
     
@@ -174,43 +177,27 @@ def solve_single_trajectory(key, omega_0, B_field, g, n_photons_initial, initial
         S_hist, alpha_hist = carry
         curr_idx = step_idx - 1
         
-        # 1. Dynamically slice arrays at the exact time step
+        # 1. Dynamically slice arrays at the exact time step (pulse is inside these arrays)
         B_val_step = jax.lax.dynamic_index_in_dim(B_field, curr_idx, axis=0, keepdims=False)
         E_val_step = jax.lax.dynamic_index_in_dim(cavity_drive, curr_idx, axis=0, keepdims=False)
         
-        # 2. Standard Unperturbed Evolution
-        # CAUGHT THE BUG: This returns the FULL (5000, 3) updated history arrays!
+        # 2. Standard Evolution 
         S_hist_updated, alpha_hist_updated = non_markovian_coupled_etd_step(
             S_hist, alpha_hist, step_idx, noise_traj_complex, Sigma_matrix_weighted, 
             B_val_step, coupling_strength, omega_0, dt
         )
         
-        # Extract strictly the 1D vectors for the current step
         current_S = S_hist_updated[step_idx]
         current_alpha = alpha_hist_updated[step_idx]
         
-        # Apply standard continuous cavity drive (if any)
+        # 3. Apply continuous cavity drive (which now contains the epsilon/dt pulse if triggered)
         z = 1j * omega_0
         phi_drive = (1.0 - jnp.exp(-z * dt)) / z
         current_alpha = current_alpha - 1j * E_val_step * phi_drive
         
-        # 3. The EXACT Instantaneous Dirac Kicks (Only triggers at pulse_idx)
-        is_pulse = (step_idx == pulse_idx)
-        
-        cos_e, sin_e = jnp.cos(epsilon_spin), jnp.sin(epsilon_spin)
-        S_kicked = jnp.array([
-            current_S[0],
-            current_S[1] * cos_e - current_S[2] * sin_e,
-            current_S[2] * cos_e + current_S[1] * sin_e
-        ], dtype=jnp.float64)
-        
-        # Snap the 1D vectors if pulse is triggered
-        final_S_step = jnp.where(is_pulse, S_kicked, current_S)
-        final_alpha_step = jnp.where(is_pulse, current_alpha - 1j * epsilon_cav, current_alpha)
-        
         # Safely overwrite the history matrix with the finalized step
-        S_hist_final = S_hist_updated.at[step_idx].set(final_S_step)
-        alpha_hist_final = alpha_hist_updated.at[step_idx].set(final_alpha_step)
+        S_hist_final = S_hist_updated.at[step_idx].set(current_S)
+        alpha_hist_final = alpha_hist_updated.at[step_idx].set(current_alpha)
         
         return (S_hist_final, alpha_hist_final), None
 
@@ -237,9 +224,11 @@ def _accumulate_batch_sums(spin_ensemble, cavity_ensemble, j_val):
         "sum_jx_sq": jnp.sum(jx_trajs**2, axis=0),
         "sum_abs_jx": jnp.sum(jnp.abs(jx_trajs), axis=0),
         "sum_psi": jnp.sum(cavity_ensemble, axis=0),
-        "sum_psi_sq": jnp.sum(jnp.abs(cavity_ensemble)**2, axis=0)
+        "sum_psi_sq": jnp.sum(jnp.abs(cavity_ensemble)**2, axis=0),
+        # Raw trajectories for correlation calculations
+        "outer_sx": (spin_ensemble[:, :, 0] / j_val).T @ (spin_ensemble[:, :, 0] / j_val),
+        "outer_r_alpha": jnp.real(cavity_ensemble).T @ jnp.real(cavity_ensemble)
     }
-
 
 @jax.jit(static_argnames=['n_spins', 'num_steps', 'use_noise', 'use_sampling'])
 def _compiled_master_processor(batched_keys, omega_0, B_field_safe, g, n_photons_initial, initial_direction, 
@@ -248,18 +237,17 @@ def _compiled_master_processor(batched_keys, omega_0, B_field_safe, g, n_photons
     
     j_val = n_spins / 2.0
     
-    # Safe vmap wrapping ensuring exactly 19 arguments
+    # Signature matched to the cleaned solve_single_trajectory
     vmap_solver = jax.vmap(
         solve_single_trajectory, 
-        in_axes=(0, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
+        in_axes=(0, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
     )
 
     def master_scan_body(carry_stats, current_batch_keys):
-        # Pass normal physics triggers (-1 for pulse_idx and 0.0 for kicks)
         batch_S, batch_alpha = vmap_solver(
             current_batch_keys, omega_0, B_field_safe, g, n_photons_initial, initial_direction, 
             n_spins, dt, num_steps, Sigma_matrix_weighted, cos_wt, sin_wt, amp, 
-            use_noise, use_sampling, cavity_drive, -1, 0.0, 0.0
+            use_noise, use_sampling, cavity_drive
         )
         
         batch_sums = _accumulate_batch_sums(batch_S, batch_alpha, j_val)
@@ -273,7 +261,9 @@ def _compiled_master_processor(batched_keys, omega_0, B_field_safe, g, n_photons
         "sum_jx_sq": jnp.zeros(num_steps, dtype=jnp.float64),
         "sum_abs_jx": jnp.zeros(num_steps, dtype=jnp.float64),
         "sum_psi": jnp.zeros(num_steps, dtype=jnp.complex128),
-        "sum_psi_sq": jnp.zeros(num_steps, dtype=jnp.float64)
+        "sum_psi_sq": jnp.zeros(num_steps, dtype=jnp.float64),
+        "outer_sx": jnp.zeros((num_steps, num_steps), dtype=jnp.float64),
+        "outer_r_alpha": jnp.zeros((num_steps, num_steps), dtype=jnp.float64)
     }
     
     final_running_stats, _ = jax.lax.scan(master_scan_body, init_stats, batched_keys)
