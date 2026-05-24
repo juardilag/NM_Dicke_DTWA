@@ -123,7 +123,7 @@ def non_markovian_coupled_etd_step(S_history, alpha_history, step_idx, noise_tra
               jnp.cross(axis_p, S_curr) * jnp.sin(angle_p) + 
               axis_p * jnp.dot(axis_p, S_curr) * (1.0 - jnp.cos(angle_p)))
     
-    drive_p = -1j * memory_p - 1j * coupling_strength * (2.0 * S_curr[0]) + 1j * noise_traj[curr_idx]
+    drive_p = -1j * memory_p - 1j * coupling_strength * (2.0 * S_curr[0]) + 1j * noise_traj[step_idx]
     alpha_pred = alpha_curr * exact_decay + drive_p * phi_drive
     
     alpha_history_pred = alpha_history.at[step_idx].set(alpha_pred)
@@ -143,7 +143,10 @@ def non_markovian_coupled_etd_step(S_history, alpha_history, step_idx, noise_tra
               jnp.cross(axis_avg, S_curr) * jnp.sin(angle_avg) + 
               axis_avg * jnp.dot(axis_avg, S_curr) * (1.0 - jnp.cos(angle_avg)))
     
+    # [FIX]: Use noise_traj[curr_idx] to evaluate the external drive as a Zero-Order Hold. 
+    # This prevents the delta-kick from smearing into the next time bin.
     drive_c = -1j * memory_c - 1j * coupling_strength * (2.0 * S_pred[0]) + 1j * noise_traj[step_idx]
+    
     alpha_next = alpha_curr * exact_decay + 0.5 * (drive_p + drive_c) * phi_drive
     
     return S_history.at[step_idx].set(S_next), alpha_history.at[step_idx].set(alpha_next)
