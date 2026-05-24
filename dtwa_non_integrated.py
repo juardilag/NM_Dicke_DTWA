@@ -36,9 +36,11 @@ def compute_explicit_bath_kernels(num_steps, dt, omega_0, alpha, omega_c, s, T, 
     
     # exp(-1j*wt) is faster to compile and mathematically identical to cos - 1j*sin
     Sigma_R_t = jnp.dot(jnp.exp(-1j * wt), Sigma_R_w * trapz_w) * dw / (2.0 * jnp.pi)
-    
-    S_bath_w = jnp.pi * jnp.abs(J_w) * jnp.where(abs_w > 1e-10, 1.0 / jnp.tanh(abs_w / (2.0 * T + 1e-12)), 0.0)
-    
+    S_bath_w = jnp.where(
+        w_grid > 1e-10, 
+        2.0 * jnp.pi * J_w * (1.0 / jnp.tanh(w_grid / (2.0 * T + 1e-12))), 
+        0.0
+    )
     return Sigma_R_t, S_bath_w, w_grid, dw
 
 
@@ -81,19 +83,23 @@ def precompute_solver_matrices(num_steps, dt, Sigma_R_t, S_bath_w, dw):
 # =====================================================================
 
 def generate_explicit_bath_noise(key, cos_wt, sin_wt, amp, use_noise=True):
-    """Generates noise via hyper-fast O(1) matrix multiplication."""
+    """Generates complex analytic noise via hyper-fast O(1) matrix multiplication."""
     half_N = amp.shape[0]
     k_re, k_im = jax.random.split(key)
     
-    # Apply amplitudes immediately to 1D arrays
+    # Generate independent Gaussian noise for both quadratures
     noise_re = jax.random.normal(k_re, (half_N,), dtype=jnp.float64) * amp
     noise_im = jax.random.normal(k_im, (half_N,), dtype=jnp.float64) * amp
     
-    xi_t_real = jnp.where(use_noise, 
-                          jnp.dot(cos_wt, noise_re) - jnp.dot(sin_wt, noise_im), 
-                          0.0)
-    return xi_t_real
-
+    # [FIX]: Expand the complex exponential to capture both real and imaginary quadratures
+    xi_real = jnp.dot(cos_wt, noise_re) + jnp.dot(sin_wt, noise_im)
+    xi_imag = jnp.dot(cos_wt, noise_im) - jnp.dot(sin_wt, noise_re)
+    
+    xi_t_complex = jnp.where(use_noise, 
+                             xi_real + 1j * xi_imag, 
+                             0.0 + 0.0j)
+    
+    return xi_t_complex
 
 def non_markovian_coupled_etd_step(S_history, alpha_history, step_idx, noise_traj, Sigma_matrix_weighted, 
                                    B_field_val, coupling_strength, omega_0, dt):
