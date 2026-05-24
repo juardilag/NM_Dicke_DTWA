@@ -74,34 +74,29 @@ def extract_stationary_correlation(C_matrix):
     return c_tau_sum / jnp.where(counts > 0, counts, 1.0)
 
 @jax.jit
-def compute_spectra(C_tau, chi_tau, dt, w_grid, is_spin):
-    """
-    Computes perfectly phase-aligned S_c(w) and Im[Chi(w)].
-    Both inputs must be exactly the same length.
-    """
+def compute_spectra(C_tau, chi_tau, dt, w_grid):
     N = len(C_tau)
     tau_grid = jnp.arange(N, dtype=jnp.float64) * dt
-    w_tau = w_grid[:, None] * tau_grid[None, :]
+    exp_kernel = jnp.exp(-1j * w_grid[:, None] * tau_grid[None, :])
     
-    # Trapezoidal integration weights
+    taper_start = int(0.7 * N)
+    taper = jnp.ones(N, dtype=jnp.float64)
+    cos_taper = 0.5 * (1.0 + jnp.cos(jnp.pi * (jnp.arange(N - taper_start) / (N - taper_start))))
+    taper = taper.at[taper_start:].set(cos_taper)
+
     weights = jnp.ones(N, dtype=jnp.float64).at[0].set(0.5).at[-1].set(0.5)
+    combined_weights = weights * taper
     
-    # 1. Correlation (Symmetric Cosine Transform)
-    # The 0.5 scaling factor is applied to Spin correlation due to Pauli matrix mapping
-    scaling_factor = jnp.where(is_spin, 0.5, 1.0)
-    S_w = 2.0 * jnp.dot(jnp.cos(w_tau), C_tau * weights) * dt * scaling_factor
+    # 1. Correlation Transform
+    S_w = 2 * jnp.real(jnp.dot(exp_kernel, C_tau * combined_weights) * dt)
     
-    # 2. Response (Causal Sine Transform)
-    chi_w = jnp.dot(jnp.sin(w_tau), chi_tau * weights) * dt
+    # 2. Response Transform
+    chi_w = jnp.dot(exp_kernel, chi_tau * combined_weights) * dt
     
-    return S_w, chi_w
+    return S_w, -jnp.imag(chi_w)
 
 
-# =====================================================================
-# 3. UNIFIED SOLVER (TIME & FREQUENCY)
-# =====================================================================
-
-def calculate_correlations_and_responses(keys, t_grid, p, t_pulse, epsilon=0.01, w_max=20.0, N_w=5000):
+def calculate_correlations_and_responses(keys, t_grid, p, t_pulse, epsilon=1e-3, w_max=20.0, N_w=5000):
     dt = t_grid[1] - t_grid[0]
     num_steps = t_grid.shape[0]
     n_total = keys.shape[0]
@@ -142,40 +137,34 @@ def calculate_correlations_and_responses(keys, t_grid, p, t_pulse, epsilon=0.01,
     )
 
     # --- CONSTRUCT STATIONARY CORRELATIONS ---
+    # Bring back the full stationary averaging to kill the noise
     mean_sx = res_base["sum_sx"] / n_total
     mean_r_alpha = res_base["sum_r_alpha"] / n_total
     
     C_spin_mat = (res_base["outer_sx"] / n_total) - jnp.outer(mean_sx, mean_sx)
-    
-    # FACTOR OF 4.0: X = 2*Re(alpha)  =>  <XX> = 4 * <Re(a)Re(a)>
-    C_cavity_mat = 4.0 * ((res_base["outer_r_alpha"] / n_total) - jnp.outer(mean_r_alpha, mean_r_alpha)) / j_val 
+    C_cavity_mat = 4.0*((res_base["outer_r_alpha"] / n_total) - jnp.outer(mean_r_alpha, mean_r_alpha)) / j_val 
 
-    # [FIX 1]: Slice matrices to exclude the initial transient! 
-    # Only evaluate correlations in the steady state.
     C_spin_mat_stat = C_spin_mat[pulse_idx:, pulse_idx:]
     C_cavity_mat_stat = C_cavity_mat[pulse_idx:, pulse_idx:]
 
+    # Averages over all diagonals, eliminating the jagged noise
     C_spin_full = extract_stationary_correlation(C_spin_mat_stat)
     C_cavity_full = extract_stationary_correlation(C_cavity_mat_stat)
 
     # --- CONSTRUCT CAUSAL RESPONSES ---
+    # Intensive normalization is retained
     mean_sx_pert = res_pert_spin["sum_sx"] / n_total
-    response_spin_full = (mean_sx_pert - mean_sx) / epsilon
+    response_spin_full = (mean_sx_pert - mean_sx) / (epsilon * j_val)
     
-    # FACTOR OF 2.0: X = 2*Re(alpha)  =>  Delta X = 2 * Delta Re(a)
     mean_r_alpha_pert = res_pert_cav["sum_r_alpha"] / n_total
-    response_cavity_full = 2.0 * (mean_r_alpha_pert - mean_r_alpha) / (epsilon * jnp.sqrt(j_val))
+    response_cavity_full = 2.0 * (mean_r_alpha_pert - mean_r_alpha) / (epsilon * j_val)
 
-    # --- ALIGN TIME GRIDS & COMPUTE SPECTRA ---
-    # [FIX 2]: Start response EXACTLY at the pulse jump. 
-    # response_spin[0] will be 0.0, perfectly aligning t=0 without phase rotation.
+    # Slice the remaining tau grid
     start_idx = pulse_idx 
-    
     N_tau = num_steps - start_idx
     tau_grid = np.arange(N_tau) * dt
     w_grid = jnp.linspace(0.0, w_max/5, N_w)
     
-    # Both Correlation and Response must be exactly N_tau length
     C_spin = np.array(C_spin_full[:N_tau])
     C_cavity = np.array(C_cavity_full[:N_tau])
     
@@ -183,8 +172,8 @@ def calculate_correlations_and_responses(keys, t_grid, p, t_pulse, epsilon=0.01,
     response_cavity = np.array(response_cavity_full[start_idx:])
 
     print("Computing Fourier Transforms...")
-    S_c_spin, S_chi_spin = compute_spectra(C_spin, response_spin, dt, w_grid, is_spin=True)
-    S_c_cavity, S_chi_cavity = compute_spectra(C_cavity, response_cavity, dt, w_grid, is_spin=False)
+    S_c_spin, S_chi_spin = compute_spectra(C_spin, response_spin, dt, w_grid)
+    S_c_cavity, S_chi_cavity = compute_spectra(C_cavity, response_cavity, dt, w_grid)
 
     print("Correlations, Responses, and Spectra Complete!")
     
