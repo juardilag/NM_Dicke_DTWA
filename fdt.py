@@ -27,20 +27,21 @@ def _accumulate_batch_sums(spin_ensemble, cavity_ensemble, j_val):
 @jax.jit(static_argnames=['n_spins', 'num_steps', 'use_noise', 'use_sampling'])
 def _compiled_master_processor(batched_keys, omega_0, B_field_safe, g, n_photons_initial, initial_direction, 
                                n_spins, dt, num_steps, Sigma_matrix_weighted, cos_wt, sin_wt, amp, 
-                               use_noise, use_sampling, cavity_drive):
+                               use_noise, use_sampling, pulse_idx, epsilon_spin, epsilon_cavity):
     
     j_val = n_spins / 2.0
     
+    # Updated signature to 18 arguments matching the new solve_single_trajectory
     vmap_solver = jax.vmap(
         solve_single_trajectory, 
-        in_axes=(0, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
+        in_axes=(0, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
     )
 
     def master_scan_body(carry_stats, current_batch_keys):
         batch_S, batch_alpha = vmap_solver(
             current_batch_keys, omega_0, B_field_safe, g, n_photons_initial, initial_direction, 
             n_spins, dt, num_steps, Sigma_matrix_weighted, cos_wt, sin_wt, amp, 
-            use_noise, use_sampling, cavity_drive
+            use_noise, use_sampling, pulse_idx, epsilon_spin, epsilon_cavity
         )
         
         batch_sums = _accumulate_batch_sums(batch_S, batch_alpha, j_val)
@@ -78,42 +79,47 @@ def compute_spectra(C_tau, chi_tau, dt, w_grid):
     N = len(C_tau)
     tau_grid = jnp.arange(N, dtype=jnp.float64) * dt
     exp_kernel = jnp.exp(-1j * w_grid[:, None] * tau_grid[None, :])
-    
-    taper_start = int(0.7 * N)
+
+    # 1. TAPERING (Windowing)
+    taper_start = int(0.85 * N)
     taper = jnp.ones(N, dtype=jnp.float64)
     cos_taper = 0.5 * (1.0 + jnp.cos(jnp.pi * (jnp.arange(N - taper_start) / (N - taper_start))))
     taper = taper.at[taper_start:].set(cos_taper)
 
+    # 2. INTEGRATION WEIGHTS
     weights = jnp.ones(N, dtype=jnp.float64).at[0].set(0.5).at[-1].set(0.5)
     combined_weights = weights * taper
+
+    # 3. DC LEAKAGE REMOVAL
+    tail_len = int(0.1 * N)
+    C_tau = C_tau - jnp.mean(C_tau[-tail_len:])
+    chi_tau = chi_tau - jnp.mean(chi_tau[-tail_len:])
     
-    # 1. Correlation Transform
-    S_w = 2 * jnp.real(jnp.dot(exp_kernel, C_tau * combined_weights) * dt)
-    
-    # 2. Response Transform
+    # 4. FOURIER TRANSFORMS
+    S_w = 2.0 * jnp.real(jnp.dot(exp_kernel, C_tau * combined_weights) * dt)
     chi_w = jnp.dot(exp_kernel, chi_tau * combined_weights) * dt
     
     return S_w, -jnp.imag(chi_w)
 
 
-def calculate_correlations_and_responses(keys, t_grid, p, t_pulse, epsilon=1e-3, w_max=20.0, N_w=5000):
+def calculate_correlations_and_responses(keys, t_grid, p, t_pulse, epsilon=1e-5, w_max=20.0, N_w=5000):
     dt = t_grid[1] - t_grid[0]
     num_steps = t_grid.shape[0]
     n_total = keys.shape[0]
     pulse_idx = int(np.searchsorted(t_grid, t_pulse))
     j_val = p['n_spins'] / 2.0
 
-    # 1. Prepare Base Fields
+    # 1. Prepare Base Fields (ETD perturbation fields are removed)
     B_base = jnp.zeros((num_steps, 3), dtype=jnp.float64).at[:, 2].set(p.get('B_z', 0.0))
-    E_base = jnp.zeros(num_steps, dtype=jnp.float64)
 
-    # 2. EXACT KUBO FORCE INTEGRATION
-    B_pert = B_base.at[pulse_idx, 0].add(epsilon / dt)
-    E_pert = E_base.at[pulse_idx].add(epsilon / dt)
-
-    # 3. Precompute bath kernels ONCE
-    Sigma_R_t, S_bath_w, _, dw = compute_explicit_bath_kernels(num_steps, dt, p['omega_0'], p['alpha'], p['omega_c'], p['s'], p['T'], w_max, N_w)
-    Sigma_matrix_weighted, cos_wt, sin_wt, amp = precompute_solver_matrices(num_steps, dt, Sigma_R_t, S_bath_w, dw)
+    # 2. Precompute bath kernels ONCE
+    Sigma_R_t, amp_full, w_grid_full, dw = compute_explicit_bath_kernels(
+        num_steps, dt, p['omega_0'], p['alpha'], p['omega_c'], p['s'], p['T'], w_max, N_w
+    )
+    
+    Sigma_matrix_weighted, cos_wt, sin_wt, amp = precompute_solver_matrices(
+        num_steps, dt, Sigma_R_t, amp_full, dw, w_grid_full
+    )
     
     batched_keys = keys[:(n_total // p['batch_size']) * p['batch_size']].reshape(-1, p['batch_size'], 2)
 
@@ -121,23 +127,25 @@ def calculate_correlations_and_responses(keys, t_grid, p, t_pulse, epsilon=1e-3,
     print(f"Executing Pass 1/3: Base Ensemble ({n_total} trajectories)...")
     res_base = _compiled_master_processor(
         batched_keys, p['omega_0'], B_base, p['g'], p['n_photons_initial'], p['initial_direction'], 
-        p['n_spins'], dt, num_steps, Sigma_matrix_weighted, cos_wt, sin_wt, amp, True, True, E_base
+        p['n_spins'], dt, num_steps, Sigma_matrix_weighted, cos_wt, sin_wt, amp, 
+        True, True, pulse_idx, 0.0, 0.0
     )
 
     print(f"Executing Pass 2/3: Spin-Perturbed Ensemble...")
     res_pert_spin = _compiled_master_processor(
-        batched_keys, p['omega_0'], B_pert, p['g'], p['n_photons_initial'], p['initial_direction'], 
-        p['n_spins'], dt, num_steps, Sigma_matrix_weighted, cos_wt, sin_wt, amp, True, True, E_base
+        batched_keys, p['omega_0'], B_base, p['g'], p['n_photons_initial'], p['initial_direction'], 
+        p['n_spins'], dt, num_steps, Sigma_matrix_weighted, cos_wt, sin_wt, amp, 
+        True, True, pulse_idx, epsilon, 0.0
     )
 
     print(f"Executing Pass 3/3: Cavity-Perturbed Ensemble...")
     res_pert_cav = _compiled_master_processor(
         batched_keys, p['omega_0'], B_base, p['g'], p['n_photons_initial'], p['initial_direction'], 
-        p['n_spins'], dt, num_steps, Sigma_matrix_weighted, cos_wt, sin_wt, amp, True, True, E_pert
+        p['n_spins'], dt, num_steps, Sigma_matrix_weighted, cos_wt, sin_wt, amp, 
+        True, True, pulse_idx, 0.0, epsilon
     )
 
     # --- CONSTRUCT STATIONARY CORRELATIONS ---
-    # Bring back the full stationary averaging to kill the noise
     mean_sx = res_base["sum_sx"] / n_total
     mean_r_alpha = res_base["sum_r_alpha"] / n_total
     
@@ -147,23 +155,22 @@ def calculate_correlations_and_responses(keys, t_grid, p, t_pulse, epsilon=1e-3,
     C_spin_mat_stat = C_spin_mat[pulse_idx:, pulse_idx:]
     C_cavity_mat_stat = C_cavity_mat[pulse_idx:, pulse_idx:]
 
-    # Averages over all diagonals, eliminating the jagged noise
     C_spin_full = extract_stationary_correlation(C_spin_mat_stat)
     C_cavity_full = extract_stationary_correlation(C_cavity_mat_stat)
 
     # --- CONSTRUCT CAUSAL RESPONSES ---
-    # Intensive normalization is retained
     mean_sx_pert = res_pert_spin["sum_sx"] / n_total
     response_spin_full = (mean_sx_pert - mean_sx) / (epsilon * j_val)
     
     mean_r_alpha_pert = res_pert_cav["sum_r_alpha"] / n_total
     response_cavity_full = 2.0 * (mean_r_alpha_pert - mean_r_alpha) / (epsilon * j_val)
 
-    # Slice the remaining tau grid
+    # Slice grids 
     start_idx = pulse_idx 
     N_tau = num_steps - start_idx
     tau_grid = np.arange(N_tau) * dt
-    w_grid = jnp.linspace(0.0, w_max/5, N_w)
+    
+    w_grid = jnp.linspace(0.0, 2.0, N_w)
     
     C_spin = np.array(C_spin_full[:N_tau])
     C_cavity = np.array(C_cavity_full[:N_tau])
