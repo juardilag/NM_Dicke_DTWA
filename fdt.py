@@ -9,29 +9,65 @@ from dtwa_non_integrated import (
 )
 
 # =====================================================================
-# 1. COMPILED MASTER ENGINE: UNIFIED PROCESSOR
+# 1. TIME-DOMAIN CORRELATION ENGINE (O(N) Memory)
 # =====================================================================
 
 @jax.jit
-def _accumulate_batch_sums(spin_ensemble, cavity_ensemble, j_val):
+def compute_exact_lag_correlation(x_batch):
+    """
+    Computes exact time-domain auto-correlation avoiding FFTs and O(N^2) memory.
+    Works for both 2D (batched trajectories) and 1D (ensemble means) arrays.
+    """
+    x_2d = jnp.atleast_2d(x_batch)
+    N = x_2d.shape[1]
+    lags = jnp.arange(N)
+
+    def scan_body(carry, tau):
+        # Shift the array left by tau
+        shifted = jnp.roll(x_2d, -tau, axis=-1)
+        # Create a mask to ignore values that wrapped around the end
+        valid_mask = jnp.arange(N) < (N - tau)
+        
+        # Multiply, mask, and sum over both time (axis=-1) and batch (if any)
+        c_tau = jnp.sum(x_2d * shifted * valid_mask)
+        return carry, c_tau
+
+    # lax.scan executes sequentially, keeping memory strictly O(N)
+    _, corr = jax.lax.scan(scan_body, None, lags)
+    return corr
+
+# =====================================================================
+# 2. COMPILED MASTER ENGINE: UNIFIED PROCESSOR
+# =====================================================================
+
+@jax.jit(static_argnames=['pulse_idx'])
+def _accumulate_batch_sums(spin_ensemble, cavity_ensemble, j_val, pulse_idx):
     sx = spin_ensemble[:, :, 0] / j_val
     r_alpha = jnp.real(cavity_ensemble)
+    
+    # 1. Extract only the stationary time-series
+    sx_stat = sx[:, pulse_idx:]
+    r_alpha_stat = r_alpha[:, pulse_idx:]
+    
+    # 2. Compute exact time-domain auto-correlation for the batch
+    sum_corr_sx = compute_exact_lag_correlation(sx_stat)
+    sum_corr_ra = compute_exact_lag_correlation(r_alpha_stat)
     
     return {
         "sum_sx": jnp.sum(sx, axis=0),
         "sum_r_alpha": jnp.sum(r_alpha, axis=0),
-        "outer_sx": sx.T @ sx,
-        "outer_r_alpha": r_alpha.T @ r_alpha
+        "sum_corr_sx": sum_corr_sx,
+        "sum_corr_ra": sum_corr_ra
     }
 
-@jax.jit(static_argnames=['n_spins', 'num_steps', 'use_noise', 'use_sampling'])
+@jax.jit(static_argnames=['n_spins', 'num_steps', 'use_noise', 'use_sampling', 'pulse_idx'])
 def _compiled_master_processor(batched_keys, omega_0, B_field_safe, g, n_photons_initial, initial_direction, 
                                n_spins, dt, num_steps, Sigma_matrix_weighted, cos_wt, sin_wt, amp, 
                                use_noise, use_sampling, pulse_idx, epsilon_spin, epsilon_cavity):
     
     j_val = n_spins / 2.0
+    N_tau = num_steps - pulse_idx
     
-    # Updated signature to 18 arguments matching the new solve_single_trajectory
     vmap_solver = jax.vmap(
         solve_single_trajectory, 
         in_axes=(0, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
@@ -44,35 +80,23 @@ def _compiled_master_processor(batched_keys, omega_0, B_field_safe, g, n_photons
             use_noise, use_sampling, pulse_idx, epsilon_spin, epsilon_cavity
         )
         
-        batch_sums = _accumulate_batch_sums(batch_S, batch_alpha, j_val)
+        batch_sums = _accumulate_batch_sums(batch_S, batch_alpha, j_val, pulse_idx)
         next_carry = {key: carry_stats[key] + batch_sums[key] for key in carry_stats}
         return next_carry, None
 
     init_stats = {
         "sum_sx": jnp.zeros(num_steps, dtype=jnp.float64),
         "sum_r_alpha": jnp.zeros(num_steps, dtype=jnp.float64),
-        "outer_sx": jnp.zeros((num_steps, num_steps), dtype=jnp.float64),
-        "outer_r_alpha": jnp.zeros((num_steps, num_steps), dtype=jnp.float64)
+        "sum_corr_sx": jnp.zeros(N_tau, dtype=jnp.float64),
+        "sum_corr_ra": jnp.zeros(N_tau, dtype=jnp.float64)
     }
     
     final_running_stats, _ = jax.lax.scan(master_scan_body, init_stats, batched_keys)
     return final_running_stats
 
-
 # =====================================================================
-# 2. EXACT FOURIER TRANSFORMS & CORRELATION EXTRACTION
+# 3. SPECTRAL TRANSFORMS & CORRELATION EXTRACTION
 # =====================================================================
-
-@jax.jit
-def extract_stationary_correlation(C_matrix):
-    n = C_matrix.shape[0]
-    rows = jnp.arange(n, dtype=jnp.int64)
-    def roll_row(i, row): return jnp.roll(row, -i)
-    aligned_matrix = jax.vmap(roll_row)(rows, C_matrix)
-    lags = jnp.arange(n, dtype=jnp.int64)
-    counts = n - lags
-    c_tau_sum = jnp.sum(aligned_matrix * (rows[:, None] + lags[None, :] < n), axis=0)
-    return c_tau_sum / jnp.where(counts > 0, counts, 1.0)
 
 @jax.jit
 def compute_spectra(C_tau, chi_tau, dt, w_grid):
@@ -101,18 +125,16 @@ def compute_spectra(C_tau, chi_tau, dt, w_grid):
     
     return S_w, -jnp.imag(chi_w)
 
-
 def calculate_correlations_and_responses(keys, t_grid, p, t_pulse, epsilon=1e-5, w_max=20.0, N_w=5000):
     dt = t_grid[1] - t_grid[0]
     num_steps = t_grid.shape[0]
     n_total = keys.shape[0]
     pulse_idx = int(np.searchsorted(t_grid, t_pulse))
     j_val = p['n_spins'] / 2.0
+    N_tau = num_steps - pulse_idx
 
-    # 1. Prepare Base Fields (ETD perturbation fields are removed)
     B_base = jnp.zeros((num_steps, 3), dtype=jnp.float64).at[:, 2].set(p.get('B_z', 0.0))
 
-    # 2. Precompute bath kernels ONCE
     Sigma_R_t, amp_full, w_grid_full, dw = compute_explicit_bath_kernels(
         num_steps, dt, p['omega_0'], p['alpha'], p['omega_c'], p['s'], p['T'], w_max, N_w
     )
@@ -123,7 +145,6 @@ def calculate_correlations_and_responses(keys, t_grid, p, t_pulse, epsilon=1e-5,
     
     batched_keys = keys[:(n_total // p['batch_size']) * p['batch_size']].reshape(-1, p['batch_size'], 2)
 
-    # --- SIMULATION PASSES ---
     print(f"Executing Pass 1/3: Base Ensemble ({n_total} trajectories)...")
     res_base = _compiled_master_processor(
         batched_keys, p['omega_0'], B_base, p['g'], p['n_photons_initial'], p['initial_direction'], 
@@ -145,50 +166,49 @@ def calculate_correlations_and_responses(keys, t_grid, p, t_pulse, epsilon=1e-5,
         True, True, pulse_idx, 0.0, epsilon
     )
 
-    # --- CONSTRUCT STATIONARY CORRELATIONS ---
+    # --- CONSTRUCT STATIONARY CORRELATIONS VIA MEAN SUBTRACTION ---
     mean_sx = res_base["sum_sx"] / n_total
     mean_r_alpha = res_base["sum_r_alpha"] / n_total
     
-    C_spin_mat = (res_base["outer_sx"] / n_total) - jnp.outer(mean_sx, mean_sx)
-    C_cavity_mat = 4.0*((res_base["outer_r_alpha"] / n_total) - jnp.outer(mean_r_alpha, mean_r_alpha)) / j_val 
+    # Extract the stationary ensemble means
+    mean_sx_stat = mean_sx[pulse_idx:]
+    mean_ra_stat = mean_r_alpha[pulse_idx:]
+    
+    # Compute the disconnected part <x><x(tau)> exactly in the time domain
+    mean_sx_corr = compute_exact_lag_correlation(mean_sx_stat)
+    mean_ra_corr = compute_exact_lag_correlation(mean_ra_stat)
 
-    C_spin_mat_stat = C_spin_mat[pulse_idx:, pulse_idx:]
-    C_cavity_mat_stat = C_cavity_mat[pulse_idx:, pulse_idx:]
-
-    C_spin_full = extract_stationary_correlation(C_spin_mat_stat)
-    C_cavity_full = extract_stationary_correlation(C_cavity_mat_stat)
+    # Normalization accounts for decreasing temporal overlap at larger lag times
+    counts = N_tau - jnp.arange(N_tau)
+    counts = jnp.where(counts > 0, counts, 1.0)
+    
+    # Assemble final stationary correlation: <x(t)x(t+tau)> - <x(t)><x(t+tau)>
+    C_spin = ((res_base["sum_corr_sx"] / n_total) - mean_sx_corr) / counts
+    C_cavity = (4.0 / j_val) * (((res_base["sum_corr_ra"] / n_total) - mean_ra_corr) / counts)
 
     # --- CONSTRUCT CAUSAL RESPONSES ---
     mean_sx_pert = res_pert_spin["sum_sx"] / n_total
-    response_spin_full = (mean_sx_pert - mean_sx) / (epsilon * j_val)
+    response_spin = np.array((mean_sx_pert - mean_sx)[pulse_idx:] / (epsilon * j_val))
     
     mean_r_alpha_pert = res_pert_cav["sum_r_alpha"] / n_total
-    response_cavity_full = 2.0 * (mean_r_alpha_pert - mean_r_alpha) / (epsilon * j_val)
+    response_cavity = np.array(2.0 * (mean_r_alpha_pert - mean_r_alpha)[pulse_idx:] / (epsilon * j_val))
 
-    # Slice grids 
-    start_idx = pulse_idx 
-    N_tau = num_steps - start_idx
+    # Slice grids (Using geometric space for resolving the 1/w pole)
     tau_grid = np.arange(N_tau) * dt
-    
-    w_grid = jnp.linspace(0.0, 2.0, N_w)
-    
-    C_spin = np.array(C_spin_full[:N_tau])
-    C_cavity = np.array(C_cavity_full[:N_tau])
-    
-    response_spin = np.array(response_spin_full[start_idx:])
-    response_cavity = np.array(response_cavity_full[start_idx:])
+    w_min = 2.0 * jnp.pi / (N_tau * dt)
+    w_grid = jnp.geomspace(w_min, w_max, N_w)
 
     print("Computing Fourier Transforms...")
-    S_c_spin, S_chi_spin = compute_spectra(C_spin, response_spin, dt, w_grid)
-    S_c_cavity, S_chi_cavity = compute_spectra(C_cavity, response_cavity, dt, w_grid)
+    S_c_spin, S_chi_spin = compute_spectra(np.array(C_spin), response_spin, dt, w_grid)
+    S_c_cavity, S_chi_cavity = compute_spectra(np.array(C_cavity), response_cavity, dt, w_grid)
 
     print("Correlations, Responses, and Spectra Complete!")
     
     return {
         "tau_grid": tau_grid,
         "w_grid": np.array(w_grid),
-        "C_spin": C_spin,
-        "C_cavity": C_cavity,
+        "C_spin": np.array(C_spin),
+        "C_cavity": np.array(C_cavity),
         "response_spin": response_spin,
         "response_cavity": response_cavity,
         "S_c_spin": np.array(S_c_spin),
