@@ -87,7 +87,7 @@ def non_markovian_coupled_etd_step(S_history, alpha_history, step_idx, noise_tra
     # --- 1. PREDICTOR ---
     memory_p = jnp.dot(Sigma_matrix_weighted[curr_idx], alpha_history)
     
-    B_eff_p_x = B_field_val[0] + 4.0 * jnp.sqrt(2.0) * coupling_strength * jnp.real(alpha_curr)
+    B_eff_p_x = B_field_val[0] + 4.0  * coupling_strength * jnp.real(alpha_curr)
     B_eff_p = jnp.array([B_eff_p_x, B_field_val[1], B_field_val[2]], dtype=jnp.float64)
     
     b_mag_p = jnp.linalg.norm(B_eff_p) + 1e-16
@@ -99,7 +99,7 @@ def non_markovian_coupled_etd_step(S_history, alpha_history, step_idx, noise_tra
               axis_p * jnp.dot(axis_p, S_curr) * (1.0 - jnp.cos(angle_p)))
     
     # [FIX]: Predictor evaluates at curr_idx, so noise MUST be at curr_idx.
-    drive_p = -1j * memory_p - 1j * 2.0 * jnp.sqrt(2.0) * coupling_strength * S_curr[0] + 1j * noise_traj[curr_idx]
+    drive_p = -1j * memory_p - 1j * 2.0 * coupling_strength * S_curr[0] + 1j * noise_traj[curr_idx]
     alpha_pred = alpha_curr * exact_decay + drive_p * phi_drive
     
     alpha_history_pred = alpha_history.at[step_idx].set(alpha_pred)
@@ -107,7 +107,7 @@ def non_markovian_coupled_etd_step(S_history, alpha_history, step_idx, noise_tra
     # --- 2. CORRECTOR ---
     memory_c = jnp.dot(Sigma_matrix_weighted[step_idx], alpha_history_pred)
     
-    B_eff_c_x = B_field_val[0] + 4.0 * jnp.sqrt(2.0) * coupling_strength * jnp.real(alpha_pred)
+    B_eff_c_x = B_field_val[0] + 4.0 * coupling_strength * jnp.real(alpha_pred)
     B_eff_c = jnp.array([B_eff_c_x, B_field_val[1], B_field_val[2]], dtype=jnp.float64)
     
     B_eff_avg = 0.5 * (B_eff_p + B_eff_c)
@@ -120,7 +120,7 @@ def non_markovian_coupled_etd_step(S_history, alpha_history, step_idx, noise_tra
               axis_avg * jnp.dot(axis_avg, S_curr) * (1.0 - jnp.cos(angle_avg)))
     
     # [CORRECT]: Corrector evaluates at step_idx.
-    drive_c = -1j * memory_c - 1j * 2.0 * jnp.sqrt(2.0) * coupling_strength * S_pred[0] + 1j * noise_traj[step_idx]
+    drive_c = -1j * memory_c - 1j * 2.0 * coupling_strength * S_pred[0] + 1j * noise_traj[step_idx]
     
     alpha_next = alpha_curr * exact_decay + 0.5 * (drive_p + drive_c) * phi_drive
     
