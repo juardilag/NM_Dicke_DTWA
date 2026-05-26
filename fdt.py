@@ -105,7 +105,7 @@ def compute_spectra(C_tau, chi_tau, dt, w_grid):
     exp_kernel = jnp.exp(-1j * w_grid[:, None] * tau_grid[None, :])
 
     # 1. TAPERING (Windowing)
-    taper_start = int(0.85 * N)
+    taper_start = int(0.5*N)
     taper = jnp.ones(N, dtype=jnp.float64)
     cos_taper = 0.5 * (1.0 + jnp.cos(jnp.pi * (jnp.arange(N - taper_start) / (N - taper_start))))
     taper = taper.at[taper_start:].set(cos_taper)
@@ -115,7 +115,7 @@ def compute_spectra(C_tau, chi_tau, dt, w_grid):
     combined_weights = weights * taper
 
     # 3. DC LEAKAGE REMOVAL
-    tail_len = int(0.1 * N)
+    tail_len = int(0.10*N)
     C_tau = C_tau - jnp.mean(C_tau[-tail_len:])
     chi_tau = chi_tau - jnp.mean(chi_tau[-tail_len:])
     
