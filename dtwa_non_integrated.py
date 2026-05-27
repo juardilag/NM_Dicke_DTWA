@@ -37,10 +37,31 @@ def precompute_solver_matrices(num_steps, dt, Sigma_R_t, amp_full, dw, w_grid):
     i_idx = jnp.arange(num_steps)[:, None]
     j_idx = jnp.arange(num_steps)[None, :]
     
+    # --- EXACT SIMPSON'S 1/3 COMPOSITE RULE ---
+    is_even_row = (i_idx % 2 == 0)
+    
+    # Base repeating pattern for bulk intervals
+    pattern = jnp.where(j_idx == 0, 1.0/3.0,
+                jnp.where(j_idx % 2 == 1, 4.0/3.0, 2.0/3.0))
+    
+    # Even rows: Perfect Simpson's bounds
+    w_even = jnp.where(j_idx == i_idx, 1.0/3.0,
+                jnp.where(j_idx < i_idx, pattern, 0.0))
+                
+    # Odd rows: Simpson's up to i-1, Trapezoidal for the last interval
+    w_odd_bulk = jnp.where(j_idx < i_idx - 1, pattern, 0.0)
+    w_odd_overlap = jnp.where(j_idx == i_idx - 1, 1.0/3.0 + 0.5, 0.0)
+    w_odd_end = jnp.where(j_idx == i_idx, 0.5, 0.0)
+    w_odd = w_odd_bulk + w_odd_overlap + w_odd_end
+    
+    # Combine into final integration weight matrix
+    simpson_weights = jnp.where(i_idx == 0, 0.0,
+                        jnp.where(i_idx == 1, jnp.where((j_idx == 0) | (j_idx == 1), 0.5, 0.0),
+                            jnp.where(is_even_row, w_even, w_odd)))
+                            
     Sigma_matrix = jnp.where(i_idx >= j_idx, Sigma_R_t[i_idx - j_idx], 0.0 + 0j)
-    trapz_weights = jnp.where((j_idx == 0) | (j_idx == i_idx), 0.5,
-                    jnp.where((j_idx > 0) & (j_idx < i_idx), 1.0, 0.0))
-    Sigma_matrix_weighted = Sigma_matrix * trapz_weights * dt
+    Sigma_matrix_weighted = Sigma_matrix * simpson_weights * dt
+    # ------------------------------------------
 
     half_N = amp_full.shape[0] // 2
     w_pos = w_grid[half_N:] 
