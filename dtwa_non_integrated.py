@@ -24,9 +24,6 @@ def compute_explicit_bath_kernels(num_steps, dt, omega_0, alpha, omega_c, s, T, 
         return -1j * jnp.dot(jnp.exp(-1j * w_grid * t), J_w_pos) * dw
     Sigma_R_t = jax.vmap(compute_sigma)(t_grid)
     
-    # [FIX] Removed Sigma_R_t.at[0].multiply(0.5). 
-    # The halving is now handled entirely and safely by the local Trapezoidal weights!
-
     coth_w = 1.0 / jnp.tanh(w_grid / (2.0 * T + 1e-12))
     amp_full = jnp.sqrt(J_w_pos * coth_w * dw / 2.0)
     

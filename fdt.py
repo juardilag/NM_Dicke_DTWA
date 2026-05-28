@@ -97,10 +97,12 @@ def _compiled_master_processor(
 # =====================================================================
 
 @jax.jit
-def compute_spectra(C_tau, chi_tau, dt, w_grid):
+def compute_spectra(C_tau, chi_tau, dt, w_grid, eta=0.01): 
     N = len(C_tau)
     tau_grid = jnp.arange(N) * dt
-    exp_kernel = jnp.exp(-1j * w_grid[:, None] * tau_grid[None, :])
+    
+    # This transforms exp(-1j * w * t) into exp(-1j * w * t) * exp(-eta * t)
+    exp_kernel = jnp.exp(-1j * (w_grid[:, None] - 1j * eta) * tau_grid[None, :])
 
     taper_start = int(0.5 * N)
     taper = jnp.ones(N)
@@ -217,8 +219,9 @@ def calculate_correlations_and_responses(keys, t_grid, p, t_pulse, epsilon=1e-5,
     w_grid = jnp.geomspace(w_min, w_max, N_w)
 
     print("Fourier transforms...")
-    S_c_spin, S_chi_spin = compute_spectra(np.array(C_spin), np.array(response_spin), dt, w_grid)
-    S_c_cavity, S_chi_cavity = compute_spectra(np.array(C_cavity), np.array(response_cavity), dt, w_grid)
+    eta_val = 7.5e-4 
+    S_c_spin, S_chi_spin = compute_spectra(np.array(C_spin), np.array(response_spin), dt, w_grid, eta=eta_val)
+    S_c_cavity, S_chi_cavity = compute_spectra(np.array(C_cavity), np.array(response_cavity), dt, w_grid, eta=eta_val)
 
     print("Done!")
 
