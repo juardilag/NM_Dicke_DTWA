@@ -219,9 +219,8 @@ def calculate_correlations_and_responses(keys, t_grid, p, t_pulse, epsilon=1e-5,
     w_grid = jnp.geomspace(w_min, w_max, N_w)
 
     print("Fourier transforms...")
-    eta_val = 7.5e-4 
-    S_c_spin, S_chi_spin = compute_spectra(np.array(C_spin), np.array(response_spin), dt, w_grid, eta=eta_val)
-    S_c_cavity, S_chi_cavity = compute_spectra(np.array(C_cavity), np.array(response_cavity), dt, w_grid, eta=eta_val)
+    S_c_spin, S_chi_spin = compute_spectra(np.array(C_spin), np.array(response_spin), dt, w_grid, eta=1e-4)
+    S_c_cavity, S_chi_cavity = compute_spectra(np.array(C_cavity), np.array(response_cavity), dt, w_grid, eta=1e-3)
 
     print("Done!")
 
