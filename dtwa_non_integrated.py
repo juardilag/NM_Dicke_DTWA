@@ -108,7 +108,7 @@ def non_markovian_coupled_heun_step(S_history, alpha_history, step_idx, xi_curr,
     return S_history.at[step_idx].set(S_next), alpha_history.at[step_idx].set(alpha_next)
 
 
-def solve_single_trajectory(key, omega_0, B_field_base, g, n_photons_initial, initial_direction, 
+def solve_single_trajectory(key, omega_0, B_field_base, g, alpha_shift, initial_direction, 
                             n_spins, dt, num_steps, Sigma_R_t, t_grid, w_pos, amp, 
                             use_noise, use_sampling, pulse_idx, epsilon_spin, epsilon_cavity):
     k_samp_spin, k_samp_alpha, k_noise = jax.random.split(key, 3)
@@ -118,8 +118,9 @@ def solve_single_trajectory(key, omega_0, B_field_base, g, n_photons_initial, in
     s0_mean = (initial_direction * n_spins) / 2.0
     s0 = jnp.where(use_sampling, s0_sampled, s0_mean)
     
-    alpha0_sampled = cavity_wigner_sampling(k_samp_alpha, n_photons_initial)
-    alpha0_mean = jnp.sqrt(jnp.array(n_photons_initial, dtype=jnp.float64)) + 0j
+
+    alpha0_mean = jnp.array(alpha_shift, dtype=jnp.complex128)
+    alpha0_sampled = cavity_wigner_sampling(k_samp_alpha, alpha0_mean)
     alpha0 = jnp.where(use_sampling, alpha0_sampled, alpha0_mean)
     
     S_history = jnp.zeros((num_steps, 3), dtype=jnp.float64).at[0].set(s0)
@@ -188,20 +189,41 @@ def solve_single_trajectory(key, omega_0, B_field_base, g, n_photons_initial, in
 
 @jax.jit
 def _accumulate_batch_sums(spin_ensemble, cavity_ensemble, j_val):
+    # Ensembles have shape: (batch_size, num_steps)
     jx_trajs = spin_ensemble[:, :, 0] / j_val
     jy_trajs = spin_ensemble[:, :, 1] / j_val
     jz_trajs = spin_ensemble[:, :, 2] / j_val
 
+    # ==========================================================
+    # --- THE FILTER: TRAJECTORY UNFOLDING ---
+    # ==========================================================
+    # 1. Look at the final state to see which well the trajectory chose
+    signs = jnp.sign(jnp.real(cavity_ensemble[:, -1])) 
+    signs = jnp.where(signs == 0, 1.0, signs) # Safety catch for exact 0
+    signs = signs[:, None] # Reshape to (batch_size, 1) for broadcasting
+
+    # 2. Fold the broken-symmetry variables into the positive well
+    folded_cavity = cavity_ensemble * signs
+    folded_jx = jx_trajs * signs
+    folded_jy = jy_trajs * signs
+    # (Note: j_z is symmetric and points the same way in both wells, do not fold it!)
+    # ==========================================================
+
     return {
-        "sum_jx": jnp.sum(jx_trajs, axis=0),
-        "sum_jy": jnp.sum(jy_trajs, axis=0),
-        "sum_jz": jnp.sum(jz_trajs, axis=0),
+        # Use the folded trajectories for the mean fields!
+        "sum_jx": jnp.sum(folded_jx, axis=0),
+        "sum_jy": jnp.sum(folded_jy, axis=0),
+        "sum_jz": jnp.sum(jz_trajs, axis=0), 
+        
+        # Squares and absolutes are immune to the negative sign, so keep them as is
         "sum_jx_sq": jnp.sum(jx_trajs**2, axis=0),
         "sum_abs_jx": jnp.sum(jnp.abs(jx_trajs), axis=0),
-        "sum_psi": jnp.sum(cavity_ensemble, axis=0),
+        
+        "sum_psi": jnp.sum(folded_cavity, axis=0),
         "sum_psi_sq": jnp.sum(jnp.abs(cavity_ensemble)**2, axis=0),
-        "outer_sx": (spin_ensemble[:, :, 0] / j_val).T @ (spin_ensemble[:, :, 0] / j_val),
-        "outer_r_alpha": jnp.real(cavity_ensemble).T @ jnp.real(cavity_ensemble)
+        
+        "outer_sx": folded_jx.T @ folded_jx,
+        "outer_r_alpha": jnp.real(folded_cavity).T @ jnp.real(folded_cavity)
     }
 
 @jax.jit(static_argnames=['n_spins', 'num_steps', 'use_noise', 'use_sampling'])
