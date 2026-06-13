@@ -40,7 +40,7 @@ from dtwa_non_integrated import (
 # =====================================================================
 
 @jax.jit
-def compute_exact_lag_correlation(x_batch):
+def compute_exact_lag_correlation(x_batch: jax.Array) -> jax.Array:
     """Sum over a batch the unnormalized lagged products for every lag tau.
 
     For each lag tau in [0, N), returns sum over trajectories and over valid time
@@ -77,7 +77,8 @@ def compute_exact_lag_correlation(x_batch):
 # =====================================================================
 
 @jax.jit(static_argnames=['pulse_idx'])
-def _accumulate_batch_sums(spin_ensemble, cavity_ensemble, j_val, pulse_idx):
+def _accumulate_batch_sums(spin_ensemble: jax.Array, cavity_ensemble: jax.Array,
+                           j_val: float, pulse_idx: int) -> dict:
     """Reduce one batch into the raw/folded sums needed for C(tau) and responses.
 
     Maintains two parallel "tracks":
@@ -156,13 +157,13 @@ def _accumulate_batch_sums(spin_ensemble, cavity_ensemble, j_val, pulse_idx):
 
 @jax.jit(static_argnames=['n_spins', 'num_steps', 'use_noise', 'use_sampling', 'pulse_idx'])
 def _compiled_master_processor(
-    batched_keys,
-    omega_0, B_field_safe, g, n_photons_initial, initial_direction,
-    n_spins, dt, num_steps,
-    Sigma_R_t, t_grid, w_pos, amp,
-    use_noise, use_sampling,
-    pulse_idx, epsilon_spin, epsilon_cavity
-):
+    batched_keys: jax.Array,
+    omega_0: float, B_field_safe: jax.Array, g: float, n_photons_initial: complex, initial_direction: jax.Array,
+    n_spins: int, dt: float, num_steps: int,
+    Sigma_R_t: jax.Array, t_grid: jax.Array, w_pos: jax.Array, amp: jax.Array,
+    use_noise: bool, use_sampling: bool,
+    pulse_idx: int, epsilon_spin: float, epsilon_cavity: float
+) -> dict:
     """vmap+scan driver accumulating the raw/folded sums for one full ensemble.
 
     Vectorizes :func:`~dtwa_non_integrated.solve_single_trajectory` across each
@@ -225,7 +226,8 @@ def _compiled_master_processor(
 # =====================================================================
 
 @jax.jit
-def compute_spectra(C_tau, chi_tau, dt, w_grid, eta=0.01):
+def compute_spectra(C_tau: jax.Array, chi_tau: jax.Array, dt: float,
+                    w_grid: jax.Array, eta: float = 0.01) -> tuple:
     """Fourier-transform C(tau) and chi(tau) into S(omega) and Im chi(omega).
 
     Uses a one-sided transform with: an artificial broadening exp(-eta tau)
@@ -294,7 +296,8 @@ def compute_spectra(C_tau, chi_tau, dt, w_grid, eta=0.01):
 # 4. MAIN DRIVER
 # =====================================================================
 
-def calculate_correlations_and_responses(keys, t_grid, p, t_pulse, epsilon=1e-5, w_max=20.0, N_w=5000):
+def calculate_correlations_and_responses(keys: jax.Array, t_grid: jax.Array, p: dict, t_pulse: float,
+                                         epsilon: float = 1e-5, w_max: float = 20.0, N_w: int = 5000) -> dict:
     """Measure C(tau), chi(tau) and their spectra for spin and cavity observables.
 
     Runs three ensembles that share the same RNG keys -- a base run, a spin-kicked

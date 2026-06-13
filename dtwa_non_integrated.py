@@ -56,7 +56,9 @@ from initial_samplings import discrete_spin_sampling_factorized, cavity_wigner_s
 # =====================================================================
 
 @jax.jit(static_argnames=['num_steps', 'N_w'])
-def compute_explicit_bath_kernels(num_steps, dt, omega_0, alpha, omega_c, s, T, w_max=40.0, N_w=5000):
+def compute_explicit_bath_kernels(num_steps: int, dt: float, omega_0: float, alpha: float,
+                                  omega_c: float, s: float, T: float,
+                                  w_max: float = 40.0, N_w: int = 5000) -> tuple:
     """Build the retarded memory kernel and noise spectrum for the cavity bath.
 
     The bath spectral density is the Ohmic-family form (notes Eq. 17),
@@ -116,7 +118,8 @@ def compute_explicit_bath_kernels(num_steps, dt, omega_0, alpha, omega_c, s, T, 
 
 
 @jax.jit(static_argnames=['num_steps'])
-def precompute_solver_arrays(num_steps, dt, Sigma_R_t, amp_full, dw, w_grid):
+def precompute_solver_arrays(num_steps: int, dt: float, Sigma_R_t: jax.Array,
+                             amp_full: jax.Array, dw: float, w_grid: jax.Array) -> tuple:
     """Slice the positive-frequency half of the noise spectrum for trajectory use.
 
     The colored-noise synthesizer only needs the positive-frequency branch of the
@@ -160,8 +163,10 @@ def precompute_solver_arrays(num_steps, dt, Sigma_R_t, amp_full, dw, w_grid):
 # 2. HIGH-SPEED TRAJECTORY SOLVERS (PURE HEUN'S METHOD)
 # =====================================================================
 
-def non_markovian_coupled_heun_step(S_history, alpha_history, step_idx, xi_curr, xi_next,
-                                   Sigma_R_t, num_steps, B_field_val, coupling_strength, omega_0, dt):
+def non_markovian_coupled_heun_step(S_history: jax.Array, alpha_history: jax.Array, step_idx: int,
+                                    xi_curr: jax.Array, xi_next: jax.Array, Sigma_R_t: jax.Array,
+                                    num_steps: int, B_field_val: jax.Array, coupling_strength: float,
+                                    omega_0: float, dt: float) -> tuple:
     """Advance the coupled spin+cavity state by one Heun predictor-corrector step.
 
     The spin is rotated rigidly about the instantaneous effective field (Rodrigues
@@ -274,9 +279,11 @@ def non_markovian_coupled_heun_step(S_history, alpha_history, step_idx, xi_curr,
     return S_history.at[step_idx].set(S_next), alpha_history.at[step_idx].set(alpha_next)
 
 
-def solve_single_trajectory(key, omega_0, B_field_base, g, alpha_shift, initial_direction,
-                            n_spins, dt, num_steps, Sigma_R_t, t_grid, w_pos, amp,
-                            use_noise, use_sampling, pulse_idx, epsilon_spin, epsilon_cavity):
+def solve_single_trajectory(key: jax.Array, omega_0: float, B_field_base: jax.Array, g: float,
+                            alpha_shift: complex, initial_direction: jax.Array, n_spins: int,
+                            dt: float, num_steps: int, Sigma_R_t: jax.Array, t_grid: jax.Array,
+                            w_pos: jax.Array, amp: jax.Array, use_noise: bool, use_sampling: bool,
+                            pulse_idx: int, epsilon_spin: float, epsilon_cavity: float) -> tuple:
     """Integrate a single coupled spin+cavity DTWA trajectory.
 
     Samples an initial spin (discrete Wigner) and cavity amplitude (Gaussian
@@ -410,7 +417,7 @@ def solve_single_trajectory(key, omega_0, B_field_base, g, alpha_shift, initial_
 # =====================================================================
 
 @jax.jit
-def _accumulate_batch_sums(spin_ensemble, cavity_ensemble, j_val):
+def _accumulate_batch_sums(spin_ensemble: jax.Array, cavity_ensemble: jax.Array, j_val: float) -> dict:
     """Reduce a batch of trajectories into running ensemble sums.
 
     Implements the Z2 symmetry "folding" used in the superradiant phase: above the
@@ -488,9 +495,11 @@ def _accumulate_batch_sums(spin_ensemble, cavity_ensemble, j_val):
     }
 
 @jax.jit(static_argnames=['n_spins', 'num_steps', 'use_noise', 'use_sampling'])
-def _compiled_master_processor(batched_keys, omega_0, B_field_safe, g, n_photons_initial, initial_direction,
-                               n_spins, dt, num_steps, Sigma_R_t, t_grid, w_pos, amp,
-                               use_noise, use_sampling, pulse_idx, epsilon_spin, epsilon_cavity):
+def _compiled_master_processor(batched_keys: jax.Array, omega_0: float, B_field_safe: jax.Array, g: float,
+                               n_photons_initial: complex, initial_direction: jax.Array, n_spins: int,
+                               dt: float, num_steps: int, Sigma_R_t: jax.Array, t_grid: jax.Array,
+                               w_pos: jax.Array, amp: jax.Array, use_noise: bool, use_sampling: bool,
+                               pulse_idx: int, epsilon_spin: float, epsilon_cavity: float) -> dict:
     """vmap over trajectories and scan over batches, accumulating ensemble sums.
 
     Vectorizes :func:`solve_single_trajectory` across one batch of keys, reduces
@@ -547,9 +556,11 @@ def _compiled_master_processor(batched_keys, omega_0, B_field_safe, g, n_photons
     return final_running_stats
 
 
-def run_dtwa(keys, t_grid, omega_0, alpha, omega_c, s, T, B_field, g, n_photons_initial, initial_direction,
-             batch_size=1000, n_spins=1, w_max=40.0, N_w=5000, use_noise=True, use_sampling=True,
-             pulse_idx=-1, epsilon_spin=0.0, epsilon_cavity=0.0):
+def run_dtwa(keys: jax.Array, t_grid: jax.Array, omega_0: float, alpha: float, omega_c: float,
+             s: float, T: float, B_field: jax.Array, g: float, n_photons_initial: complex,
+             initial_direction: jax.Array, batch_size: int = 1000, n_spins: int = 1,
+             w_max: float = 40.0, N_w: int = 5000, use_noise: bool = True, use_sampling: bool = True,
+             pulse_idx: int = -1, epsilon_spin: float = 0.0, epsilon_cavity: float = 0.0) -> dict:
     """Top-level driver: run the full DTWA ensemble and return ensemble averages.
 
     Builds the bath kernels, batches the supplied RNG keys, runs the compiled
