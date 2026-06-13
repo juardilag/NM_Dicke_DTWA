@@ -1,7 +1,49 @@
+"""
+Discrete Truncated Wigner Approximation (DTWA) for the open Dicke model
+with an *explicit*, non-integrated cavity mode.
+
+This module implements the coupled semiclassical equations of motion derived in
+the accompanying Keldysh notes ("Single Spin and Single Lossy Boson Model"):
+
+    Cavity (non-Markovian generalized Langevin equation, Eq. 14):
+        i d/dt psi_c(t) = omega_0 psi_c(t)
+                          + ∫_{-inf}^{t} dt' Sigma_R(t - t') psi_c(t')
+                          + (2 sqrt(2) g / sqrt(N)) S_x(t)
+                          - xi(t)
+
+    Spin (kinematic precession, Eqs. 15-16):
+        d/dt S(t) = B_eff(t) x S(t),
+        B_eff(t) = B + x_hat (2 sqrt(2) g / sqrt(N)) (psi_c(t) + psi_c*(t))
+
+The cavity carries the bath memory kernel Sigma_R(t) (retarded self-energy) and
+is driven by the colored stochastic noise xi(t) whose statistics are fixed by
+the fluctuation-dissipation theorem, <xi(t) xi*(t')> = -i Sigma_K(t - t').
+
+Pipeline
+--------
+1. ``compute_explicit_bath_kernels``  : build Sigma_R(t) and the noise amplitude
+                                        spectrum from the Ohmic-family J(omega).
+2. ``precompute_solver_arrays``       : slice the positive-frequency half used by
+                                        the per-trajectory noise generator.
+3. ``solve_single_trajectory``        : integrate one coupled spin+cavity
+                                        trajectory with a Heun predictor-corrector.
+4. ``_compiled_master_processor``     : vmap over a batch of trajectories and
+                                        accumulate ensemble statistics.
+5. ``run_dtwa``                       : top-level driver returning ensemble means.
+
+Conventions
+-----------
+* Spins are stored as Cartesian vectors S = (S_x, S_y, S_z) in units where the
+  full collective spin length is j = N / 2 (so intensive components are S / j).
+* The cavity amplitude ``alpha`` is the complex coherent-state field psi_c.
+* All real arrays are float64 and the cavity is complex128 (x64 is enabled at
+  import time via the JAX_ENABLE_X64 environment flag).
+"""
+
 import os
 os.environ["JAX_ENABLE_X64"] = "True"
 os.environ["JAX_ENABLE_TRITON_GEMM"] = "0"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["JAX_LOG_LEVEL"] = "error"
 
 import jax
@@ -10,30 +52,106 @@ import numpy as np
 from initial_samplings import discrete_spin_sampling_factorized, cavity_wigner_sampling
 
 # =====================================================================
-# 1. KERNELS & PRECOMPUTE ENGINE 
+# 1. KERNELS & PRECOMPUTE ENGINE
 # =====================================================================
 
 @jax.jit(static_argnames=['num_steps', 'N_w'])
 def compute_explicit_bath_kernels(num_steps, dt, omega_0, alpha, omega_c, s, T, w_max=40.0, N_w=5000):
+    """Build the retarded memory kernel and noise spectrum for the cavity bath.
+
+    The bath spectral density is the Ohmic-family form (notes Eq. 17),
+        J(omega) = alpha * omega_c * (omega / omega_c)**s * exp(-omega / omega_c),  omega > 0,
+    from which we compute:
+
+    * Sigma_R(t) = -i ∫_0^inf dw J(w) exp(-i w t)      (retarded self-energy, Eq. 18)
+    * the per-frequency noise amplitude sqrt( J(w) coth(w / 2T) dw / 2 ) used to
+      synthesize the colored noise xi(t) whose target correlation is
+      <xi(t) xi*(t')> = ∫_0^inf dw J(w) coth(w / 2T) exp(-i w (t - t'))  (Eq. 19).
+
+    Parameters
+    ----------
+    num_steps : int (static)
+        Number of time steps; Sigma_R is tabulated on t = [0, dt, ..., (num_steps-1) dt].
+    dt : float
+        Time-step size.
+    omega_0 : float
+        Bare cavity frequency (passed through for interface symmetry; not used here).
+    alpha : float
+        Dimensionless system-bath coupling strength (the "alpha" of J(omega)).
+    omega_c : float
+        Bath high-frequency cutoff.
+    s : float
+        Ohmicity exponent: s < 1 sub-Ohmic, s = 1 Ohmic, s > 1 super-Ohmic.
+    T : float
+        Bath temperature (same energy units as the frequencies; kB = 1).
+    w_max : float, optional
+        Half-width of the symmetric frequency grid used for the FT integrals.
+    N_w : int (static), optional
+        Number of frequency grid points on [-w_max, w_max].
+
+    Returns
+    -------
+    Sigma_R_t : complex128 array, shape (num_steps,)
+        Retarded self-energy kernel sampled at the simulation time grid.
+    amp_full : float64 array, shape (N_w,)
+        Noise amplitude sqrt(J(w) coth(w/2T) dw / 2) on the *full* (signed) w grid.
+    w_grid : float64 array, shape (N_w,)
+        The signed frequency grid [-w_max, w_max].
+    dw : float
+        Frequency spacing of ``w_grid``.
+    """
     w_grid = jnp.linspace(-w_max, w_max, N_w, dtype=jnp.float64)
     dw = w_grid[1] - w_grid[0]
     J_w_pos = jnp.where(w_grid > 1e-10, alpha * omega_c * (w_grid/omega_c)**s * jnp.exp(-w_grid/omega_c), 0.0)
-    
+
     t_grid = jnp.arange(num_steps) * dt
     def compute_sigma(t):
         return -1j * jnp.dot(jnp.exp(-1j * w_grid * t), J_w_pos) * dw
     Sigma_R_t = jax.vmap(compute_sigma)(t_grid)
-    
+
     coth_w = 1.0 / jnp.tanh(w_grid / (2.0 * T + 1e-12))
     amp_full = jnp.sqrt(J_w_pos * coth_w * dw / 2.0)
-    
+
     return Sigma_R_t, amp_full, w_grid, dw
 
 
 @jax.jit(static_argnames=['num_steps'])
 def precompute_solver_arrays(num_steps, dt, Sigma_R_t, amp_full, dw, w_grid):
+    """Slice the positive-frequency half of the noise spectrum for trajectory use.
+
+    The colored-noise synthesizer only needs the positive-frequency branch of the
+    amplitude spectrum (the negative branch is redundant once xi is built from a
+    real cosine/sine pair). This helper splits ``amp_full``/``w_grid`` at w = 0 and
+    rebuilds the time grid.
+
+    Parameters
+    ----------
+    num_steps : int (static)
+        Number of time steps.
+    dt : float
+        Time-step size.
+    Sigma_R_t : complex128 array, shape (num_steps,)
+        Retarded kernel from :func:`compute_explicit_bath_kernels` (passed through).
+    amp_full : float64 array, shape (N_w,)
+        Full signed-frequency noise amplitude.
+    dw : float
+        Frequency spacing (unused here; kept for interface symmetry).
+    w_grid : float64 array, shape (N_w,)
+        Signed frequency grid.
+
+    Returns
+    -------
+    Sigma_R_t : complex128 array, shape (num_steps,)
+        Passed through unchanged.
+    t_grid : float64 array, shape (num_steps,)
+        Simulation time grid t = arange(num_steps) * dt.
+    w_pos : float64 array, shape (N_w // 2,)
+        Positive-frequency grid (w >= 0).
+    amp : float64 array, shape (N_w // 2,)
+        Noise amplitude on the positive-frequency grid.
+    """
     half_N = amp_full.shape[0] // 2
-    w_pos = w_grid[half_N:] 
+    w_pos = w_grid[half_N:]
     amp = amp_full[half_N:]
     t_grid = jnp.arange(num_steps, dtype=jnp.float64) * dt
     return Sigma_R_t, t_grid, w_pos, amp
@@ -42,90 +160,194 @@ def precompute_solver_arrays(num_steps, dt, Sigma_R_t, amp_full, dw, w_grid):
 # 2. HIGH-SPEED TRAJECTORY SOLVERS (PURE HEUN'S METHOD)
 # =====================================================================
 
-def non_markovian_coupled_heun_step(S_history, alpha_history, step_idx, xi_curr, xi_next, 
+def non_markovian_coupled_heun_step(S_history, alpha_history, step_idx, xi_curr, xi_next,
                                    Sigma_R_t, num_steps, B_field_val, coupling_strength, omega_0, dt):
+    """Advance the coupled spin+cavity state by one Heun predictor-corrector step.
+
+    The spin is rotated rigidly about the instantaneous effective field (Rodrigues
+    rotation, exactly norm-preserving), while the cavity is advanced with an
+    explicit Heun (trapezoidal) update of its non-Markovian Langevin equation. The
+    retarded memory integral ∫ Sigma_R(t - t') psi_c(t') dt' is evaluated on the
+    fly with trapezoidal weights, so no full convolution matrix is ever stored.
+
+    Parameters
+    ----------
+    S_history : float64 array, shape (num_steps, 3)
+        Spin trajectory buffer; rows [0 .. step_idx-1] are already filled.
+    alpha_history : complex128 array, shape (num_steps,)
+        Cavity trajectory buffer; entries [0 .. step_idx-1] are already filled.
+    step_idx : int
+        Index of the new step being computed (>= 1).
+    xi_curr : complex128 scalar
+        Bath noise xi(t) at the current time (t = (step_idx-1) dt).
+    xi_next : complex128 scalar
+        Bath noise xi(t) at the target time (t = step_idx dt).
+    Sigma_R_t : complex128 array, shape (num_steps,)
+        Tabulated retarded memory kernel.
+    num_steps : int
+        Total trajectory length (used to size the memory-row generator).
+    B_field_val : float64 array, shape (3,)
+        External field B at this step.
+    coupling_strength : float
+        g / sqrt(N), the per-particle light-matter coupling.
+    omega_0 : float
+        Bare cavity frequency.
+    dt : float
+        Time-step size.
+
+    Returns
+    -------
+    S_history : float64 array, shape (num_steps, 3)
+        Buffer with row ``step_idx`` set to the new spin vector.
+    alpha_history : complex128 array, shape (num_steps,)
+        Buffer with entry ``step_idx`` set to the new cavity amplitude.
+
+    Notes
+    -----
+    The B_eff x-component uses ``4 * coupling_strength * Re(alpha)`` and the cavity
+    spin drive uses ``2 * coupling_strength * S_x``; these encode the
+    S = (1/sqrt(2)) J_c convention of the notes.
+    """
     curr_idx = step_idx - 1
     S_curr = S_history[curr_idx]
     alpha_curr = alpha_history[curr_idx]
 
     # ==========================================================
     # --- EXACT ON-THE-FLY TRAPEZOIDAL ROW GENERATOR ---
+    # Builds one row of the retarded convolution, ∫ Sigma_R(t-t') alpha(t') dt',
+    # with trapezoidal weights (0.5 at both endpoints) and strict causality.
     # ==========================================================
     j_idx = jnp.arange(num_steps)
-    
+
     def get_memory(target_idx, alpha_hist):
         weights = jnp.where(j_idx < target_idx, 1.0, 0.0)
         weights = jnp.where(j_idx == 0, 0.5, weights)
         weights = jnp.where(j_idx == target_idx, 0.5, weights)
         weights = jnp.where(target_idx == 0, 0.0, weights)
-                
+
         safe_idx = jnp.where(target_idx >= j_idx, target_idx - j_idx, 0)
         sigma_row = jnp.where(target_idx >= j_idx, Sigma_R_t[safe_idx], 0.0j)
-        
+
         return jnp.dot(sigma_row * weights * dt, alpha_hist)
     # ==========================================================
 
     # --- 1. PREDICTOR (Standard Explicit Euler) ---
     memory_p = get_memory(curr_idx, alpha_history)
-    
+
     B_eff_p_x = B_field_val[0] + 4.0 * coupling_strength * jnp.real(alpha_curr)
     B_eff_p = jnp.array([B_eff_p_x, B_field_val[1], B_field_val[2]], dtype=jnp.float64)
     b_mag_p = jnp.linalg.norm(B_eff_p) + 1e-16
     axis_p = B_eff_p / b_mag_p
-    angle_p = b_mag_p * dt  
-    
-    S_pred = (S_curr * jnp.cos(angle_p) + 
-              jnp.cross(axis_p, S_curr) * jnp.sin(angle_p) + 
+    angle_p = b_mag_p * dt
+
+    S_pred = (S_curr * jnp.cos(angle_p) +
+              jnp.cross(axis_p, S_curr) * jnp.sin(angle_p) +
               axis_p * jnp.dot(axis_p, S_curr) * (1.0 - jnp.cos(angle_p)))
-    
+
     drive_p = -1j * memory_p - 1j * 2.0 * coupling_strength * S_curr[0] + 1j * xi_curr
-    
+
     # [FIX] ETD is gone! Full explicit derivative calculation:
     d_alpha_p = -1j * omega_0 * alpha_curr + drive_p
     alpha_pred = alpha_curr + dt * d_alpha_p
     alpha_history_pred = alpha_history.at[step_idx].set(alpha_pred)
-    
+
     # --- 2. CORRECTOR (Standard Explicit Trapezoidal) ---
     memory_c = get_memory(step_idx, alpha_history_pred)
-    
+
     B_eff_c_x = B_field_val[0] + 4.0 * coupling_strength * jnp.real(alpha_pred)
     B_eff_c = jnp.array([B_eff_c_x, B_field_val[1], B_field_val[2]], dtype=jnp.float64)
     B_eff_avg = 0.5 * (B_eff_p + B_eff_c)
     b_mag_avg = jnp.linalg.norm(B_eff_avg) + 1e-16
     axis_avg = B_eff_avg / b_mag_avg
     angle_avg = b_mag_avg * dt
-    
-    S_next = (S_curr * jnp.cos(angle_avg) + 
-              jnp.cross(axis_avg, S_curr) * jnp.sin(angle_avg) + 
+
+    S_next = (S_curr * jnp.cos(angle_avg) +
+              jnp.cross(axis_avg, S_curr) * jnp.sin(angle_avg) +
               axis_avg * jnp.dot(axis_avg, S_curr) * (1.0 - jnp.cos(angle_avg)))
-    
+
     drive_c = -1j * memory_c - 1j * 2.0 * coupling_strength * S_pred[0] + 1j * xi_next
-    
+
     # [FIX] Corrector combines k1 and k2 directly
     d_alpha_c = -1j * omega_0 * alpha_pred + drive_c
     alpha_next = alpha_curr + 0.5 * dt * (d_alpha_p + d_alpha_c)
-    
+
     return S_history.at[step_idx].set(S_next), alpha_history.at[step_idx].set(alpha_next)
 
 
-def solve_single_trajectory(key, omega_0, B_field_base, g, alpha_shift, initial_direction, 
-                            n_spins, dt, num_steps, Sigma_R_t, t_grid, w_pos, amp, 
+def solve_single_trajectory(key, omega_0, B_field_base, g, alpha_shift, initial_direction,
+                            n_spins, dt, num_steps, Sigma_R_t, t_grid, w_pos, amp,
                             use_noise, use_sampling, pulse_idx, epsilon_spin, epsilon_cavity):
+    """Integrate a single coupled spin+cavity DTWA trajectory.
+
+    Samples an initial spin (discrete Wigner) and cavity amplitude (Gaussian
+    Wigner), synthesizes the colored bath noise xi(t), then time-steps the coupled
+    equations with :func:`non_markovian_coupled_heun_step`. An optional impulsive
+    perturbation ("pulse") can be applied at a single time index to measure linear
+    response.
+
+    Parameters
+    ----------
+    key : jax.random.PRNGKey
+        RNG key for this trajectory (split internally into spin / cavity / noise).
+    omega_0 : float
+        Bare cavity frequency.
+    B_field_base : float64 array, shape (num_steps, 3)
+        External field at every time step.
+    g : float
+        Light-matter coupling (the per-particle strength is g / sqrt(n_spins)).
+    alpha_shift : complex
+        Mean initial cavity amplitude (coherent displacement).
+    initial_direction : float64 array, shape (3,)
+        Initial spin direction (need not be normalized).
+    n_spins : int
+        Number of two-level atoms N; the collective spin length is j = N / 2.
+    dt : float
+        Time-step size.
+    num_steps : int
+        Number of time steps.
+    Sigma_R_t : complex128 array, shape (num_steps,)
+        Retarded memory kernel.
+    t_grid : float64 array, shape (num_steps,)
+        Simulation time grid.
+    w_pos : float64 array, shape (N_w // 2,)
+        Positive-frequency grid for the noise synthesizer.
+    amp : float64 array, shape (N_w // 2,)
+        Noise amplitude spectrum on ``w_pos``.
+    use_noise : bool
+        If True, inject the bath noise xi(t); if False, xi = 0 (deterministic).
+    use_sampling : bool
+        If True, sample initial conditions from the Wigner distribution;
+        if False, use the mean-field initial state.
+    pulse_idx : int
+        Time index at which to apply the impulsive perturbation (use a value
+        outside [1, num_steps) to disable, e.g. -1).
+    epsilon_spin : float
+        Rotation angle of the impulsive spin kick about the x-axis (rotates y->z).
+    epsilon_cavity : float
+        Imaginary-quadrature kick added to the cavity amplitude at the pulse.
+
+    Returns
+    -------
+    final_S_history : float64 array, shape (num_steps, 3)
+        Full spin trajectory.
+    final_alpha_history : complex128 array, shape (num_steps,)
+        Full cavity-amplitude trajectory.
+    """
     k_samp_spin, k_samp_alpha, k_noise = jax.random.split(key, 3)
     coupling_strength = g / jnp.sqrt(n_spins)
-    
+
     s0_sampled = discrete_spin_sampling_factorized(k_samp_spin, initial_direction, n_spins) / 2.0
     s0_mean = (initial_direction * n_spins) / 2.0
     s0 = jnp.where(use_sampling, s0_sampled, s0_mean)
-    
+
 
     alpha0_mean = jnp.array(alpha_shift, dtype=jnp.complex128)
     alpha0_sampled = cavity_wigner_sampling(k_samp_alpha, alpha0_mean)
     alpha0 = jnp.where(use_sampling, alpha0_sampled, alpha0_mean)
-    
+
     S_history = jnp.zeros((num_steps, 3), dtype=jnp.float64).at[0].set(s0)
     alpha_history = jnp.zeros((num_steps,), dtype=jnp.complex128).at[0].set(alpha0)
-    
+
     half_N = amp.shape[0]
     k_re, k_im = jax.random.split(k_noise)
     noise_re = jax.random.normal(k_re, (half_N,), dtype=jnp.float64) * amp
@@ -138,48 +360,48 @@ def solve_single_trajectory(key, omega_0, B_field_base, g, alpha_shift, initial_
         return jnp.where(use_noise, xi_real + 1j * xi_imag, 0j)
 
     xi_0 = compute_noise(t_grid[0])
-    
+
     def scan_body(carry, step_idx):
         S_hist, alpha_hist, xi_curr = carry
         curr_idx = step_idx - 1
-        
+
         B_val_step = jax.lax.dynamic_index_in_dim(B_field_base, curr_idx, axis=0, keepdims=False)
         xi_next = compute_noise(t_grid[step_idx])
-        
+
         # [FIX] Swapped ETD for pure Heun predictor-corrector
         S_hist_updated, alpha_hist_updated = non_markovian_coupled_heun_step(
-            S_hist, alpha_hist, step_idx, xi_curr, xi_next, Sigma_R_t, num_steps, 
+            S_hist, alpha_hist, step_idx, xi_curr, xi_next, Sigma_R_t, num_steps,
             B_val_step, coupling_strength, omega_0, dt
         )
-        
+
         current_S = S_hist_updated[step_idx]
         current_alpha = alpha_hist_updated[step_idx]
-        
+
         # ==========================================================
-        # EXACT ANALYTICAL JUMPS
+        # EXACT ANALYTICAL JUMPS (impulsive linear-response perturbation)
         # ==========================================================
         is_pulse = (step_idx == pulse_idx)
         cos_e = jnp.cos(epsilon_spin)
         sin_e = jnp.sin(epsilon_spin)
-        
+
         S_y_jumped = current_S[1] * cos_e - current_S[2] * sin_e
         S_z_jumped = current_S[2] * cos_e + current_S[1] * sin_e
         S_jumped = jnp.array([current_S[0], S_y_jumped, S_z_jumped])
-        
+
         current_S = jnp.where(is_pulse, S_jumped, current_S)
         alpha_jumped = current_alpha + 1j * epsilon_cavity
         current_alpha = jnp.where(is_pulse, alpha_jumped, current_alpha)
         # ==========================================================
-        
+
         S_hist_final = S_hist_updated.at[step_idx].set(current_S)
         alpha_hist_final = alpha_hist_updated.at[step_idx].set(current_alpha)
-        
+
         return (S_hist_final, alpha_hist_final, xi_next), None
 
     init_carry = (S_history, alpha_history, xi_0)
     time_indices = jnp.arange(1, num_steps, dtype=jnp.int64)
     (final_S_history, final_alpha_history, _), _ = jax.lax.scan(scan_body, init_carry, time_indices)
-    
+
     return final_S_history, final_alpha_history
 
 
@@ -189,6 +411,42 @@ def solve_single_trajectory(key, omega_0, B_field_base, g, alpha_shift, initial_
 
 @jax.jit
 def _accumulate_batch_sums(spin_ensemble, cavity_ensemble, j_val):
+    """Reduce a batch of trajectories into running ensemble sums.
+
+    Implements the Z2 symmetry "folding" used in the superradiant phase: above the
+    critical coupling each trajectory commits to one of two mirror-image wells
+    (+psi_c, +J_x) or (-psi_c, -J_x), so the naive mean cancels to ~0. We fold every
+    trajectory into the positive well before averaging the symmetry-breaking
+    observables (J_x, J_y, psi_c), while symmetric observables (J_z) and quadratic
+    observables (J_x^2, |J_x|, |psi_c|^2) are left untouched.
+
+    Risk-1 fix: the fold sign is the sign of the *time-averaged* Re(psi_c) over the
+    whole trajectory (a majority vote), not the sign of the single final snapshot.
+    A late, isolated inter-well hop can no longer flip a trajectory's entire-history
+    label.
+
+    Parameters
+    ----------
+    spin_ensemble : float64 array, shape (batch_size, num_steps, 3)
+        Spin trajectories for the batch.
+    cavity_ensemble : complex128 array, shape (batch_size, num_steps)
+        Cavity-amplitude trajectories for the batch.
+    j_val : float
+        Collective spin length j = N / 2 (intensive normalization).
+
+    Returns
+    -------
+    dict of arrays
+        Running sums over the batch axis:
+        ``sum_jx``, ``sum_jy``  : folded intensive transverse magnetizations, shape (num_steps,)
+        ``sum_jz``              : (unfolded) intensive longitudinal magnetization, shape (num_steps,)
+        ``sum_jx_sq``           : sum of (J_x / j)^2, shape (num_steps,)
+        ``sum_abs_jx``          : sum of |J_x / j|, shape (num_steps,)
+        ``sum_psi``             : folded cavity amplitude, shape (num_steps,) complex
+        ``sum_psi_sq``          : sum of |psi_c|^2, shape (num_steps,)
+        ``outer_sx``            : folded-J_x outer product, shape (num_steps, num_steps)
+        ``outer_r_alpha``       : folded-Re(psi_c) outer product, shape (num_steps, num_steps)
+    """
     # Ensembles have shape: (batch_size, num_steps)
     jx_trajs = spin_ensemble[:, :, 0] / j_val
     jy_trajs = spin_ensemble[:, :, 1] / j_val
@@ -197,10 +455,13 @@ def _accumulate_batch_sums(spin_ensemble, cavity_ensemble, j_val):
     # ==========================================================
     # --- THE FILTER: TRAJECTORY UNFOLDING ---
     # ==========================================================
-    # 1. Look at the final state to see which well the trajectory chose
-    signs = jnp.sign(jnp.real(cavity_ensemble[:, -1])) 
-    signs = jnp.where(signs == 0, 1.0, signs) # Safety catch for exact 0
-    signs = signs[:, None] # Reshape to (batch_size, 1) for broadcasting
+    # 1. Decide each trajectory's well by a MAJORITY VOTE over its full history
+    #    (time-averaged Re(psi_c)), not the single final snapshot. This is robust
+    #    to an isolated late inter-well hop (Risk 1).
+    mean_re_alpha = jnp.mean(jnp.real(cavity_ensemble), axis=1)
+    signs = jnp.sign(mean_re_alpha)
+    signs = jnp.where(signs == 0, 1.0, signs)  # Safety catch for exact 0
+    signs = signs[:, None]  # Reshape to (batch_size, 1) for broadcasting
 
     # 2. Fold the broken-symmetry variables into the positive well
     folded_cavity = cavity_ensemble * signs
@@ -213,34 +474,57 @@ def _accumulate_batch_sums(spin_ensemble, cavity_ensemble, j_val):
         # Use the folded trajectories for the mean fields!
         "sum_jx": jnp.sum(folded_jx, axis=0),
         "sum_jy": jnp.sum(folded_jy, axis=0),
-        "sum_jz": jnp.sum(jz_trajs, axis=0), 
-        
+        "sum_jz": jnp.sum(jz_trajs, axis=0),
+
         # Squares and absolutes are immune to the negative sign, so keep them as is
         "sum_jx_sq": jnp.sum(jx_trajs**2, axis=0),
         "sum_abs_jx": jnp.sum(jnp.abs(jx_trajs), axis=0),
-        
+
         "sum_psi": jnp.sum(folded_cavity, axis=0),
         "sum_psi_sq": jnp.sum(jnp.abs(cavity_ensemble)**2, axis=0),
-        
+
         "outer_sx": folded_jx.T @ folded_jx,
         "outer_r_alpha": jnp.real(folded_cavity).T @ jnp.real(folded_cavity)
     }
 
 @jax.jit(static_argnames=['n_spins', 'num_steps', 'use_noise', 'use_sampling'])
-def _compiled_master_processor(batched_keys, omega_0, B_field_safe, g, n_photons_initial, initial_direction, 
-                               n_spins, dt, num_steps, Sigma_R_t, t_grid, w_pos, amp, 
+def _compiled_master_processor(batched_keys, omega_0, B_field_safe, g, n_photons_initial, initial_direction,
+                               n_spins, dt, num_steps, Sigma_R_t, t_grid, w_pos, amp,
                                use_noise, use_sampling, pulse_idx, epsilon_spin, epsilon_cavity):
-    
+    """vmap over trajectories and scan over batches, accumulating ensemble sums.
+
+    Vectorizes :func:`solve_single_trajectory` across one batch of keys, reduces
+    each batch with :func:`_accumulate_batch_sums`, and accumulates the running
+    sums over all batches with a ``lax.scan``. Keeping only running sums (not the
+    full trajectory tensor) bounds memory to O(num_steps^2) regardless of the
+    total trajectory count.
+
+    Parameters
+    ----------
+    batched_keys : PRNGKey array, shape (n_batches, batch_size, 2)
+        Pre-batched RNG keys.
+    omega_0, B_field_safe, g, n_photons_initial, initial_direction, n_spins, dt, num_steps,
+    Sigma_R_t, t_grid, w_pos, amp, use_noise, use_sampling, pulse_idx, epsilon_spin, epsilon_cavity
+        Forwarded to :func:`solve_single_trajectory` (see that function). ``n_spins``,
+        ``num_steps``, ``use_noise`` and ``use_sampling`` are static (trigger
+        recompilation when changed). ``n_photons_initial`` is used as ``alpha_shift``.
+
+    Returns
+    -------
+    dict of arrays
+        The summed statistics from :func:`_accumulate_batch_sums`, totalled across
+        all trajectories.
+    """
     j_val = n_spins / 2.0
     vmap_solver = jax.vmap(
-        solve_single_trajectory, 
+        solve_single_trajectory,
         in_axes=(0, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
     )
 
     def master_scan_body(carry_stats, current_batch_keys):
         batch_S, batch_alpha = vmap_solver(
-            current_batch_keys, omega_0, B_field_safe, g, n_photons_initial, initial_direction, 
-            n_spins, dt, num_steps, Sigma_R_t, t_grid, w_pos, amp, 
+            current_batch_keys, omega_0, B_field_safe, g, n_photons_initial, initial_direction,
+            n_spins, dt, num_steps, Sigma_R_t, t_grid, w_pos, amp,
             use_noise, use_sampling, pulse_idx, epsilon_spin, epsilon_cavity
         )
         batch_sums = _accumulate_batch_sums(batch_S, batch_alpha, j_val)
@@ -258,21 +542,81 @@ def _compiled_master_processor(batched_keys, omega_0, B_field_safe, g, n_photons
         "outer_sx": jnp.zeros((num_steps, num_steps), dtype=jnp.float64),
         "outer_r_alpha": jnp.zeros((num_steps, num_steps), dtype=jnp.float64)
     }
-    
+
     final_running_stats, _ = jax.lax.scan(master_scan_body, init_stats, batched_keys)
     return final_running_stats
 
 
-def run_dtwa(keys, t_grid, omega_0, alpha, omega_c, s, T, B_field, g, n_photons_initial, initial_direction, 
-             batch_size=1000, n_spins=1, w_max=40.0, N_w=5000, use_noise=True, use_sampling=True, 
+def run_dtwa(keys, t_grid, omega_0, alpha, omega_c, s, T, B_field, g, n_photons_initial, initial_direction,
+             batch_size=1000, n_spins=1, w_max=40.0, N_w=5000, use_noise=True, use_sampling=True,
              pulse_idx=-1, epsilon_spin=0.0, epsilon_cavity=0.0):
-    
+    """Top-level driver: run the full DTWA ensemble and return ensemble averages.
+
+    Builds the bath kernels, batches the supplied RNG keys, runs the compiled
+    master processor, and normalizes the running sums into ensemble-averaged
+    observables.
+
+    Parameters
+    ----------
+    keys : PRNGKey array, shape (n_total, 2)
+        One RNG key per trajectory. Trajectories beyond ``n_batches * batch_size``
+        are dropped.
+    t_grid : float64 array, shape (num_steps,)
+        Uniform simulation time grid (dt and num_steps are inferred from it).
+    omega_0 : float
+        Bare cavity frequency.
+    alpha : float
+        Bath coupling strength of J(omega) (note: distinct from the cavity field).
+    omega_c : float
+        Bath cutoff frequency.
+    s : float
+        Bath ohmicity exponent.
+    T : float
+        Bath temperature (kB = 1).
+    B_field : scalar, shape (3,), or shape (num_steps, 3)
+        External field. A scalar is placed on the z-axis; a 3-vector is held
+        constant in time; a full (num_steps, 3) array is used as-is.
+    g : float
+        Light-matter coupling.
+    n_photons_initial : complex
+        Mean initial cavity amplitude (passed as ``alpha_shift``).
+    initial_direction : array, shape (3,)
+        Initial spin direction.
+    batch_size : int, optional
+        Trajectories per compiled batch (memory/throughput trade-off).
+    n_spins : int, optional
+        Number of atoms N.
+    w_max : float, optional
+        Frequency-grid half-width for the bath kernels.
+    N_w : int, optional
+        Number of frequency grid points.
+    use_noise : bool, optional
+        Enable bath noise (TWA) vs. deterministic (mean-field) cavity.
+    use_sampling : bool, optional
+        Enable Wigner sampling of initial conditions.
+    pulse_idx : int, optional
+        Time index of the impulsive perturbation (default -1 = disabled).
+    epsilon_spin : float, optional
+        Spin-kick angle for linear response.
+    epsilon_cavity : float, optional
+        Cavity-kick magnitude for linear response.
+
+    Returns
+    -------
+    dict of numpy.ndarray
+        ``j_x``, ``j_y``, ``j_z``    : intensive magnetizations (folded for x, y), shape (num_steps,)
+        ``rms_jx``                   : sqrt(<(J_x/j)^2>), the symmetry-robust order parameter
+        ``abs_jx``                   : <|J_x/j|>
+        ``mean_psi``                 : folded mean cavity amplitude (complex)
+        ``abs_mean_psi``             : |mean_psi|
+        ``mean_photon_number``       : <|psi_c|^2> - 1/2 (Wigner vacuum subtracted)
+    """
     dt = t_grid[1] - t_grid[0]
     num_steps = t_grid.shape[0]
     n_total = keys.shape[0]
-    
-    safe_w_max = w_max 
-    
+
+    safe_w_max = w_max
+
     B_arr = jnp.asarray(B_field)
     if B_arr.ndim == 0:
         B_field_safe = jnp.zeros((num_steps, 3)).at[:, 2].set(B_arr)
@@ -280,7 +624,7 @@ def run_dtwa(keys, t_grid, omega_0, alpha, omega_c, s, T, B_field, g, n_photons_
         B_field_safe = jnp.tile(B_arr, (num_steps, 1))
     else:
         B_field_safe = jnp.reshape(B_arr, (num_steps, 3))
-    
+
     Sigma_R_t, amp_full, w_grid, dw = compute_explicit_bath_kernels(
         num_steps, dt, omega_0, alpha, omega_c, s, T, safe_w_max, N_w)
 
@@ -291,10 +635,10 @@ def run_dtwa(keys, t_grid, omega_0, alpha, omega_c, s, T, B_field, g, n_photons_
     batched_keys = keys[:n_batches * batch_size].reshape(n_batches, batch_size, -1)
 
     print(f"Executing {n_total} trajectories across {n_batches} compiled batches...")
-    
+
     running_stats = _compiled_master_processor(
-        batched_keys, omega_0, B_field_safe, g, n_photons_initial, initial_direction, 
-        n_spins, dt, num_steps, Sigma_R_t, t_grid_pre, w_pos, amp, 
+        batched_keys, omega_0, B_field_safe, g, n_photons_initial, initial_direction,
+        n_spins, dt, num_steps, Sigma_R_t, t_grid_pre, w_pos, amp,
         use_noise, use_sampling, pulse_idx, epsilon_spin, epsilon_cavity
     )
 
@@ -308,8 +652,8 @@ def run_dtwa(keys, t_grid, omega_0, alpha, omega_c, s, T, B_field, g, n_photons_
         "abs_mean_psi": jnp.abs(running_stats["sum_psi"] / n_total),
         "mean_photon_number": (running_stats["sum_psi_sq"] / n_total) - 0.5
     }
-    
+
     final_stats_cpu = {key: np.array(value) for key, value in final_stats.items()}
     print("Simulation Complete!")
-    
+
     return final_stats_cpu
