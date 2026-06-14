@@ -49,6 +49,7 @@ os.environ["JAX_LOG_LEVEL"] = "error"
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.scipy.special import gamma
 from initial_samplings import discrete_spin_sampling_factorized, cavity_wigner_sampling
 
 # =====================================================================
@@ -106,13 +107,18 @@ def compute_explicit_bath_kernels(num_steps: int, dt: float, omega_0: float, alp
     dw = w_grid[1] - w_grid[0]
     J_w_pos = jnp.where(w_grid > 1e-10, alpha * omega_c * (w_grid/omega_c)**s * jnp.exp(-w_grid/omega_c), 0.0)
 
+    # [A1] Analytic retarded self-energy: the half-sided Fourier transform of the
+    # Ohmic-family J(omega) has the exact closed form
+    #     Sigma_R(t) = -i alpha omega_c^2 Gamma(s+1) / (1 + i omega_c t)^(s+1).
+    # This is machine-exact and avoids the Riemann-sum / frequency-aliasing error
+    # of the previous grid quadrature (which grew as dw * t_max approached pi).
     t_grid = jnp.arange(num_steps) * dt
-    def compute_sigma(t):
-        return -1j * jnp.dot(jnp.exp(-1j * w_grid * t), J_w_pos) * dw
-    Sigma_R_t = jax.vmap(compute_sigma)(t_grid)
+    Sigma_R_t = -1j * alpha * omega_c**2 * gamma(s + 1.0) / (1.0 + 1j * omega_c * t_grid)**(s + 1.0)
 
+    # [A3] Guard against the 0 * inf -> NaN at omega = 0 (coth diverges while J
+    # vanishes). Only frequencies with J(omega) > 0 contribute to the noise.
     coth_w = 1.0 / jnp.tanh(w_grid / (2.0 * T + 1e-12))
-    amp_full = jnp.sqrt(J_w_pos * coth_w * dw / 2.0)
+    amp_full = jnp.sqrt(jnp.where(J_w_pos > 0.0, J_w_pos * coth_w * dw / 2.0, 0.0))
 
     return Sigma_R_t, amp_full, w_grid, dw
 
@@ -148,8 +154,11 @@ def precompute_solver_arrays(num_steps: int, dt: float, Sigma_R_t: jax.Array,
         Passed through unchanged.
     t_grid : float64 array, shape (num_steps,)
         Simulation time grid t = arange(num_steps) * dt.
-    w_pos : float64 array, shape (N_w // 2,)
-        Positive-frequency grid (w >= 0).
+    cos_wt : float64 array, shape (num_steps, N_w // 2)
+        Precomputed cos(t * w) on the positive-frequency grid, shared by all
+        trajectories so each colored-noise realization is a single GEMM.
+    sin_wt : float64 array, shape (num_steps, N_w // 2)
+        Precomputed sin(t * w) on the positive-frequency grid.
     amp : float64 array, shape (N_w // 2,)
         Noise amplitude on the positive-frequency grid.
     """
@@ -157,7 +166,13 @@ def precompute_solver_arrays(num_steps: int, dt: float, Sigma_R_t: jax.Array,
     w_pos = w_grid[half_N:]
     amp = amp_full[half_N:]
     t_grid = jnp.arange(num_steps, dtype=jnp.float64) * dt
-    return Sigma_R_t, t_grid, w_pos, amp
+    # [P3] Build the shared time-frequency trig matrices ONCE. The colored noise
+    # for every trajectory then reduces to (num_steps, half_N) @ (half_N,) GEMMs,
+    # instead of recomputing cos/sin of a length-half_N vector at every step.
+    wt = t_grid[:, None] * w_pos[None, :]
+    cos_wt = jnp.cos(wt)
+    sin_wt = jnp.sin(wt)
+    return Sigma_R_t, t_grid, cos_wt, sin_wt, amp
 
 # =====================================================================
 # 2. HIGH-SPEED TRAJECTORY SOLVERS (PURE HEUN'S METHOD)
@@ -281,8 +296,8 @@ def non_markovian_coupled_heun_step(S_history: jax.Array, alpha_history: jax.Arr
 
 def solve_single_trajectory(key: jax.Array, omega_0: float, B_field_base: jax.Array, g: float,
                             alpha_shift: complex, initial_direction: jax.Array, n_spins: int,
-                            dt: float, num_steps: int, Sigma_R_t: jax.Array, t_grid: jax.Array,
-                            w_pos: jax.Array, amp: jax.Array, use_noise: bool, use_sampling: bool,
+                            dt: float, num_steps: int, Sigma_R_t: jax.Array, cos_wt: jax.Array,
+                            sin_wt: jax.Array, amp: jax.Array, use_noise: bool, use_sampling: bool,
                             pulse_idx: int, epsilon_spin: float, epsilon_cavity: float) -> tuple:
     """Integrate a single coupled spin+cavity DTWA trajectory.
 
@@ -314,12 +329,13 @@ def solve_single_trajectory(key: jax.Array, omega_0: float, B_field_base: jax.Ar
         Number of time steps.
     Sigma_R_t : complex128 array, shape (num_steps,)
         Retarded memory kernel.
-    t_grid : float64 array, shape (num_steps,)
-        Simulation time grid.
-    w_pos : float64 array, shape (N_w // 2,)
-        Positive-frequency grid for the noise synthesizer.
+    cos_wt : float64 array, shape (num_steps, N_w // 2)
+        Shared cos(t * w) matrix for synthesizing the colored noise (see
+        :func:`precompute_solver_arrays`).
+    sin_wt : float64 array, shape (num_steps, N_w // 2)
+        Shared sin(t * w) matrix for synthesizing the colored noise.
     amp : float64 array, shape (N_w // 2,)
-        Noise amplitude spectrum on ``w_pos``.
+        Noise amplitude spectrum on the positive-frequency grid.
     use_noise : bool
         If True, inject the bath noise xi(t); if False, xi = 0 (deterministic).
     use_sampling : bool
@@ -360,20 +376,20 @@ def solve_single_trajectory(key: jax.Array, omega_0: float, B_field_base: jax.Ar
     noise_re = jax.random.normal(k_re, (half_N,), dtype=jnp.float64) * amp
     noise_im = jax.random.normal(k_im, (half_N,), dtype=jnp.float64) * amp
 
-    def compute_noise(t):
-        wt = t * w_pos
-        xi_real = jnp.dot(jnp.cos(wt), noise_re) + jnp.dot(jnp.sin(wt), noise_im)
-        xi_imag = jnp.dot(jnp.cos(wt), noise_im) - jnp.dot(jnp.sin(wt), noise_re)
-        return jnp.where(use_noise, xi_real + 1j * xi_imag, 0j)
-
-    xi_0 = compute_noise(t_grid[0])
+    # [P3] Synthesize the entire noise trajectory xi(t) in one pair of GEMMs
+    # against the shared trig matrices (identical to the old per-step recipe:
+    #   xi(t) = sum_k (a_k + i b_k) exp(-i w_k t),  <xi(t) xi*(t')> = -i Sigma_K).
+    xi_real = cos_wt @ noise_re + sin_wt @ noise_im
+    xi_imag = cos_wt @ noise_im - sin_wt @ noise_re
+    xi_all = jnp.where(use_noise, xi_real + 1j * xi_imag, 0.0)
 
     def scan_body(carry, step_idx):
-        S_hist, alpha_hist, xi_curr = carry
+        S_hist, alpha_hist = carry
         curr_idx = step_idx - 1
 
         B_val_step = jax.lax.dynamic_index_in_dim(B_field_base, curr_idx, axis=0, keepdims=False)
-        xi_next = compute_noise(t_grid[step_idx])
+        xi_curr = xi_all[curr_idx]
+        xi_next = xi_all[step_idx]
 
         # [FIX] Swapped ETD for pure Heun predictor-corrector
         S_hist_updated, alpha_hist_updated = non_markovian_coupled_heun_step(
@@ -403,11 +419,11 @@ def solve_single_trajectory(key: jax.Array, omega_0: float, B_field_base: jax.Ar
         S_hist_final = S_hist_updated.at[step_idx].set(current_S)
         alpha_hist_final = alpha_hist_updated.at[step_idx].set(current_alpha)
 
-        return (S_hist_final, alpha_hist_final, xi_next), None
+        return (S_hist_final, alpha_hist_final), None
 
-    init_carry = (S_history, alpha_history, xi_0)
+    init_carry = (S_history, alpha_history)
     time_indices = jnp.arange(1, num_steps, dtype=jnp.int64)
-    (final_S_history, final_alpha_history, _), _ = jax.lax.scan(scan_body, init_carry, time_indices)
+    (final_S_history, final_alpha_history), _ = jax.lax.scan(scan_body, init_carry, time_indices)
 
     return final_S_history, final_alpha_history
 
@@ -451,8 +467,6 @@ def _accumulate_batch_sums(spin_ensemble: jax.Array, cavity_ensemble: jax.Array,
         ``sum_abs_jx``          : sum of |J_x / j|, shape (num_steps,)
         ``sum_psi``             : folded cavity amplitude, shape (num_steps,) complex
         ``sum_psi_sq``          : sum of |psi_c|^2, shape (num_steps,)
-        ``outer_sx``            : folded-J_x outer product, shape (num_steps, num_steps)
-        ``outer_r_alpha``       : folded-Re(psi_c) outer product, shape (num_steps, num_steps)
     """
     # Ensembles have shape: (batch_size, num_steps)
     jx_trajs = spin_ensemble[:, :, 0] / j_val
@@ -489,16 +503,13 @@ def _accumulate_batch_sums(spin_ensemble: jax.Array, cavity_ensemble: jax.Array,
 
         "sum_psi": jnp.sum(folded_cavity, axis=0),
         "sum_psi_sq": jnp.sum(jnp.abs(cavity_ensemble)**2, axis=0),
-
-        "outer_sx": folded_jx.T @ folded_jx,
-        "outer_r_alpha": jnp.real(folded_cavity).T @ jnp.real(folded_cavity)
     }
 
 @jax.jit(static_argnames=['n_spins', 'num_steps', 'use_noise', 'use_sampling'])
 def _compiled_master_processor(batched_keys: jax.Array, omega_0: float, B_field_safe: jax.Array, g: float,
                                n_photons_initial: complex, initial_direction: jax.Array, n_spins: int,
-                               dt: float, num_steps: int, Sigma_R_t: jax.Array, t_grid: jax.Array,
-                               w_pos: jax.Array, amp: jax.Array, use_noise: bool, use_sampling: bool,
+                               dt: float, num_steps: int, Sigma_R_t: jax.Array, cos_wt: jax.Array,
+                               sin_wt: jax.Array, amp: jax.Array, use_noise: bool, use_sampling: bool,
                                pulse_idx: int, epsilon_spin: float, epsilon_cavity: float) -> dict:
     """vmap over trajectories and scan over batches, accumulating ensemble sums.
 
@@ -533,7 +544,7 @@ def _compiled_master_processor(batched_keys: jax.Array, omega_0: float, B_field_
     def master_scan_body(carry_stats, current_batch_keys):
         batch_S, batch_alpha = vmap_solver(
             current_batch_keys, omega_0, B_field_safe, g, n_photons_initial, initial_direction,
-            n_spins, dt, num_steps, Sigma_R_t, t_grid, w_pos, amp,
+            n_spins, dt, num_steps, Sigma_R_t, cos_wt, sin_wt, amp,
             use_noise, use_sampling, pulse_idx, epsilon_spin, epsilon_cavity
         )
         batch_sums = _accumulate_batch_sums(batch_S, batch_alpha, j_val)
@@ -548,8 +559,6 @@ def _compiled_master_processor(batched_keys: jax.Array, omega_0: float, B_field_
         "sum_abs_jx": jnp.zeros(num_steps, dtype=jnp.float64),
         "sum_psi": jnp.zeros(num_steps, dtype=jnp.complex128),
         "sum_psi_sq": jnp.zeros(num_steps, dtype=jnp.float64),
-        "outer_sx": jnp.zeros((num_steps, num_steps), dtype=jnp.float64),
-        "outer_r_alpha": jnp.zeros((num_steps, num_steps), dtype=jnp.float64)
     }
 
     final_running_stats, _ = jax.lax.scan(master_scan_body, init_stats, batched_keys)
@@ -639,7 +648,7 @@ def run_dtwa(keys: jax.Array, t_grid: jax.Array, omega_0: float, alpha: float, o
     Sigma_R_t, amp_full, w_grid, dw = compute_explicit_bath_kernels(
         num_steps, dt, omega_0, alpha, omega_c, s, T, safe_w_max, N_w)
 
-    Sigma_R_t, t_grid_pre, w_pos, amp = precompute_solver_arrays(
+    Sigma_R_t, t_grid_pre, cos_wt, sin_wt, amp = precompute_solver_arrays(
         num_steps, dt, Sigma_R_t, amp_full, dw, w_grid)
 
     n_batches = n_total // batch_size
@@ -649,7 +658,7 @@ def run_dtwa(keys: jax.Array, t_grid: jax.Array, omega_0: float, alpha: float, o
 
     running_stats = _compiled_master_processor(
         batched_keys, omega_0, B_field_safe, g, n_photons_initial, initial_direction,
-        n_spins, dt, num_steps, Sigma_R_t, t_grid_pre, w_pos, amp,
+        n_spins, dt, num_steps, Sigma_R_t, cos_wt, sin_wt, amp,
         use_noise, use_sampling, pulse_idx, epsilon_spin, epsilon_cavity
     )
 

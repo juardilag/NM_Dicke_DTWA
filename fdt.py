@@ -160,7 +160,7 @@ def _compiled_master_processor(
     batched_keys: jax.Array,
     omega_0: float, B_field_safe: jax.Array, g: float, n_photons_initial: complex, initial_direction: jax.Array,
     n_spins: int, dt: float, num_steps: int,
-    Sigma_R_t: jax.Array, t_grid: jax.Array, w_pos: jax.Array, amp: jax.Array,
+    Sigma_R_t: jax.Array, cos_wt: jax.Array, sin_wt: jax.Array, amp: jax.Array,
     use_noise: bool, use_sampling: bool,
     pulse_idx: int, epsilon_spin: float, epsilon_cavity: float
 ) -> dict:
@@ -200,7 +200,7 @@ def _compiled_master_processor(
             current_batch_keys,
             omega_0, B_field_safe, g, n_photons_initial, initial_direction,
             n_spins, dt, num_steps,
-            Sigma_R_t, t_grid, w_pos, amp,
+            Sigma_R_t, cos_wt, sin_wt, amp,
             use_noise, use_sampling,
             pulse_idx, epsilon_spin, epsilon_cavity
         )
@@ -353,7 +353,7 @@ def calculate_correlations_and_responses(keys: jax.Array, t_grid: jax.Array, p: 
         w_max, N_w
     )
 
-    Sigma_R_t, t_grid_pre, w_pos, amp = precompute_solver_arrays(
+    Sigma_R_t, t_grid_pre, cos_wt, sin_wt, amp = precompute_solver_arrays(
         num_steps, dt, Sigma_R_t, amp_full, dw, w_grid_full
     )
 
@@ -364,7 +364,7 @@ def calculate_correlations_and_responses(keys: jax.Array, t_grid: jax.Array, p: 
         batched_keys,
         p['omega_0'], B_base, p['g'], p['n_photons_initial'], p['initial_direction'],
         p['n_spins'], dt, num_steps,
-        Sigma_R_t, t_grid_pre, w_pos, amp,
+        Sigma_R_t, cos_wt, sin_wt, amp,
         True, True,
         pulse_idx, 0.0, 0.0
     )
@@ -374,7 +374,7 @@ def calculate_correlations_and_responses(keys: jax.Array, t_grid: jax.Array, p: 
         batched_keys,
         p['omega_0'], B_base, p['g'], p['n_photons_initial'], p['initial_direction'],
         p['n_spins'], dt, num_steps,
-        Sigma_R_t, t_grid_pre, w_pos, amp,
+        Sigma_R_t, cos_wt, sin_wt, amp,
         True, True,
         pulse_idx, epsilon, 0.0
     )
@@ -384,7 +384,7 @@ def calculate_correlations_and_responses(keys: jax.Array, t_grid: jax.Array, p: 
         batched_keys,
         p['omega_0'], B_base, p['g'], p['n_photons_initial'], p['initial_direction'],
         p['n_spins'], dt, num_steps,
-        Sigma_R_t, t_grid_pre, w_pos, amp,
+        Sigma_R_t, cos_wt, sin_wt, amp,
         True, True,
         pulse_idx, 0.0, epsilon
     )
