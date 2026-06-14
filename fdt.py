@@ -297,7 +297,8 @@ def compute_spectra(C_tau: jax.Array, chi_tau: jax.Array, dt: float,
 # =====================================================================
 
 def calculate_correlations_and_responses(keys: jax.Array, t_grid: jax.Array, p: dict, t_pulse: float,
-                                         epsilon: float = 1e-5, w_max: float = 20.0, N_w: int = 5000) -> dict:
+                                         epsilon: float = 1e-5, w_max: float = 20.0, N_w: int = 5000,
+                                         mem_window: int = None) -> dict:
     """Measure C(tau), chi(tau) and their spectra for spin and cavity observables.
 
     Runs three ensembles that share the same RNG keys -- a base run, a spin-kicked
@@ -325,6 +326,10 @@ def calculate_correlations_and_responses(keys: jax.Array, t_grid: jax.Array, p: 
         Upper edge of the output frequency grid.
     N_w : int, optional
         Number of output frequency points (geometric grid).
+    mem_window : int or None, optional
+        [P1] Retarded-kernel truncation length. ``None`` (default) keeps the full
+        history (exact); an integer L truncates the memory integral to the last L
+        steps. Validate by confirming the spectra are unchanged as L grows.
 
     Returns
     -------
@@ -356,6 +361,16 @@ def calculate_correlations_and_responses(keys: jax.Array, t_grid: jax.Array, p: 
     Sigma_R_t, t_grid_pre, cos_wt, sin_wt, amp = precompute_solver_arrays(
         num_steps, dt, Sigma_R_t, amp_full, dw, w_grid_full
     )
+
+    # [P1] Memory-window truncation (None -> full, exact). The same truncated
+    # kernel is shared by all three passes.
+    mag = np.abs(np.asarray(Sigma_R_t)); mag = mag / (mag[0] + 1e-300)
+    def _decay(tol):
+        idx = int(np.argmax(mag < tol)); return idx if idx > 0 else num_steps
+    L = num_steps if mem_window is None else int(min(mem_window, num_steps))
+    Sigma_R_t = Sigma_R_t[:L]
+    print(f"Memory window L={L}/{num_steps}  (|Sigma_R| <1e-3 by step "
+          f"{_decay(1e-3)}, <1e-4 by {_decay(1e-4)})")
 
     batched_keys = keys[:(n_total // p['batch_size']) * p['batch_size']].reshape(-1, p['batch_size'], 2)
 

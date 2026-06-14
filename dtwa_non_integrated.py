@@ -180,15 +180,18 @@ def precompute_solver_arrays(num_steps: int, dt: float, Sigma_R_t: jax.Array,
 
 def non_markovian_coupled_heun_step(S_history: jax.Array, alpha_history: jax.Array, step_idx: int,
                                     xi_curr: jax.Array, xi_next: jax.Array, Sigma_R_t: jax.Array,
-                                    num_steps: int, B_field_val: jax.Array, coupling_strength: float,
+                                    B_field_val: jax.Array, coupling_strength: float,
                                     omega_0: float, dt: float) -> tuple:
     """Advance the coupled spin+cavity state by one Heun predictor-corrector step.
 
     The spin is rotated rigidly about the instantaneous effective field (Rodrigues
-    rotation, exactly norm-preserving), while the cavity is advanced with an
-    explicit Heun (trapezoidal) update of its non-Markovian Langevin equation. The
-    retarded memory integral ∫ Sigma_R(t - t') psi_c(t') dt' is evaluated on the
-    fly with trapezoidal weights, so no full convolution matrix is ever stored.
+    rotation, exactly norm-preserving). The cavity is advanced with an
+    integrating-factor ETDRK2 predictor-corrector ([A2]): the bare oscillation
+    -i omega_0 psi is propagated exactly (no spurious energy drift), while the
+    memory, spin drive and noise are handled to 2nd order. The retarded memory
+    integral ∫ Sigma_R(t - t') psi_c(t') dt' is evaluated on the fly with
+    trapezoidal weights over a truncated window of length L = Sigma_R_t.shape[0]
+    ([P1]), so it costs O(L) per step instead of O(num_steps).
 
     Parameters
     ----------
@@ -202,10 +205,9 @@ def non_markovian_coupled_heun_step(S_history: jax.Array, alpha_history: jax.Arr
         Bath noise xi(t) at the current time (t = (step_idx-1) dt).
     xi_next : complex128 scalar
         Bath noise xi(t) at the target time (t = step_idx dt).
-    Sigma_R_t : complex128 array, shape (num_steps,)
-        Tabulated retarded memory kernel.
-    num_steps : int
-        Total trajectory length (used to size the memory-row generator).
+    Sigma_R_t : complex128 array, shape (L,)
+        Tabulated retarded memory kernel, truncated to the memory-window length L
+        ([P1]); L == num_steps means the full, untruncated history.
     B_field_val : float64 array, shape (3,)
         External field B at this step.
     coupling_strength : float
@@ -233,23 +235,44 @@ def non_markovian_coupled_heun_step(S_history: jax.Array, alpha_history: jax.Arr
     alpha_curr = alpha_history[curr_idx]
 
     # ==========================================================
-    # --- EXACT ON-THE-FLY TRAPEZOIDAL ROW GENERATOR ---
-    # Builds one row of the retarded convolution, ∫ Sigma_R(t-t') alpha(t') dt',
-    # with trapezoidal weights (0.5 at both endpoints) and strict causality.
+    # --- [P1] WINDOWED TRAPEZOIDAL ROW GENERATOR ---
+    # Evaluates the retarded convolution ∫ Sigma_R(t-t') alpha(t') dt' using only
+    # the most recent L = Sigma_R_t.shape[0] history points (trapezoidal weights,
+    # 0.5 at the endpoints, strict causality). Truncating to L turns the O(N^2)
+    # history sum into O(N*L); L == num_steps reproduces the full convolution
+    # exactly, since the kernel beyond the window is the part that has decayed.
     # ==========================================================
-    j_idx = jnp.arange(num_steps)
+    L = Sigma_R_t.shape[0]
+    k_idx = jnp.arange(L)
 
     def get_memory(target_idx, alpha_hist):
-        weights = jnp.where(j_idx < target_idx, 1.0, 0.0)
-        weights = jnp.where(j_idx == 0, 0.5, weights)
-        weights = jnp.where(j_idx == target_idx, 0.5, weights)
+        start = jnp.maximum(target_idx - L + 1, 0)
+        block = jax.lax.dynamic_slice(alpha_hist, (start,), (L,))
+        block_j = start + k_idx
+        lag = target_idx - block_j
+        valid = lag >= 0
+        safe_lag = jnp.where(valid, lag, 0)
+        sigma_vals = jnp.where(valid, Sigma_R_t[safe_lag], 0.0j)
+
+        weights = jnp.where(valid, 1.0, 0.0)
+        weights = jnp.where(block_j == 0, 0.5, weights)
+        weights = jnp.where(block_j == target_idx, 0.5, weights)
         weights = jnp.where(target_idx == 0, 0.0, weights)
 
-        safe_idx = jnp.where(target_idx >= j_idx, target_idx - j_idx, 0)
-        sigma_row = jnp.where(target_idx >= j_idx, Sigma_R_t[safe_idx], 0.0j)
-
-        return jnp.dot(sigma_row * weights * dt, alpha_hist)
+        return jnp.dot(sigma_vals * weights * dt, block)
     # ==========================================================
+
+    # --- [A2] Integrating-factor (ETDRK2) coefficients for dpsi/dt = -i w0 psi + N.
+    # The bare oscillation is integrated EXACTLY (|E| = 1, no energy drift); a
+    # 2nd-order exponential predictor-corrector handles the drive N. As w0 -> 0
+    # these reduce to (E, phi1, b1, b2) -> (1, 1, dt/2, dt/2), i.e. plain Heun.
+    z = -1j * omega_0 * dt
+    E = jnp.exp(z)
+    _small = jnp.abs(z) < 1e-8
+    phi1 = jnp.where(_small, 1.0 + z / 2.0, (E - 1.0) / z)
+    phi2 = jnp.where(_small, 0.5 + z / 6.0, (E - 1.0 - z) / (z * z))
+    b1 = dt * (phi1 - phi2)
+    b2 = dt * phi2
 
     # --- 1. PREDICTOR (Standard Explicit Euler) ---
     memory_p = get_memory(curr_idx, alpha_history)
@@ -266,9 +289,8 @@ def non_markovian_coupled_heun_step(S_history: jax.Array, alpha_history: jax.Arr
 
     drive_p = -1j * memory_p - 1j * 2.0 * coupling_strength * S_curr[0] + 1j * xi_curr
 
-    # [FIX] ETD is gone! Full explicit derivative calculation:
-    d_alpha_p = -1j * omega_0 * alpha_curr + drive_p
-    alpha_pred = alpha_curr + dt * d_alpha_p
+    # [A2] Exponential predictor (ETD exponential Euler): linear part exact.
+    alpha_pred = E * alpha_curr + dt * phi1 * drive_p
     alpha_history_pred = alpha_history.at[step_idx].set(alpha_pred)
 
     # --- 2. CORRECTOR (Standard Explicit Trapezoidal) ---
@@ -287,9 +309,8 @@ def non_markovian_coupled_heun_step(S_history: jax.Array, alpha_history: jax.Arr
 
     drive_c = -1j * memory_c - 1j * 2.0 * coupling_strength * S_pred[0] + 1j * xi_next
 
-    # [FIX] Corrector combines k1 and k2 directly
-    d_alpha_c = -1j * omega_0 * alpha_pred + drive_c
-    alpha_next = alpha_curr + 0.5 * dt * (d_alpha_p + d_alpha_c)
+    # [A2] ETDRK2 corrector: exact linear propagator + 2nd-order drive.
+    alpha_next = E * alpha_curr + b1 * drive_p + b2 * drive_c
 
     return S_history.at[step_idx].set(S_next), alpha_history.at[step_idx].set(alpha_next)
 
@@ -391,9 +412,9 @@ def solve_single_trajectory(key: jax.Array, omega_0: float, B_field_base: jax.Ar
         xi_curr = xi_all[curr_idx]
         xi_next = xi_all[step_idx]
 
-        # [FIX] Swapped ETD for pure Heun predictor-corrector
+        # ETDRK2 (integrating-factor) coupled spin+cavity step over a memory window
         S_hist_updated, alpha_hist_updated = non_markovian_coupled_heun_step(
-            S_hist, alpha_hist, step_idx, xi_curr, xi_next, Sigma_R_t, num_steps,
+            S_hist, alpha_hist, step_idx, xi_curr, xi_next, Sigma_R_t,
             B_val_step, coupling_strength, omega_0, dt
         )
 
@@ -569,7 +590,8 @@ def run_dtwa(keys: jax.Array, t_grid: jax.Array, omega_0: float, alpha: float, o
              s: float, T: float, B_field: jax.Array, g: float, n_photons_initial: complex,
              initial_direction: jax.Array, batch_size: int = 1000, n_spins: int = 1,
              w_max: float = 40.0, N_w: int = 5000, use_noise: bool = True, use_sampling: bool = True,
-             pulse_idx: int = -1, epsilon_spin: float = 0.0, epsilon_cavity: float = 0.0) -> dict:
+             pulse_idx: int = -1, epsilon_spin: float = 0.0, epsilon_cavity: float = 0.0,
+             mem_window: int = None) -> dict:
     """Top-level driver: run the full DTWA ensemble and return ensemble averages.
 
     Builds the bath kernels, batches the supplied RNG keys, runs the compiled
@@ -620,6 +642,12 @@ def run_dtwa(keys: jax.Array, t_grid: jax.Array, omega_0: float, alpha: float, o
         Spin-kick angle for linear response.
     epsilon_cavity : float, optional
         Cavity-kick magnitude for linear response.
+    mem_window : int or None, optional
+        [P1] Number of leading retarded-kernel taps to retain in the memory
+        integral. ``None`` (default) keeps the full history (O(num_steps^2),
+        exact). An integer L truncates to the last L steps (O(num_steps * L));
+        choose L past where the printed kernel decay is negligible and confirm
+        results are unchanged (convergence check).
 
     Returns
     -------
@@ -650,6 +678,18 @@ def run_dtwa(keys: jax.Array, t_grid: jax.Array, omega_0: float, alpha: float, o
 
     Sigma_R_t, t_grid_pre, cos_wt, sin_wt, amp = precompute_solver_arrays(
         num_steps, dt, Sigma_R_t, amp_full, dw, w_grid)
+
+    # [P1] Memory-window truncation: keep only the leading L taps of the retarded
+    # kernel (the part before it has decayed). None -> full O(N^2) history (exact).
+    mag = np.abs(np.asarray(Sigma_R_t))
+    mag = mag / (mag[0] + 1e-300)
+    def _decay(tol):
+        idx = int(np.argmax(mag < tol))
+        return idx if idx > 0 else num_steps
+    L = num_steps if mem_window is None else int(min(mem_window, num_steps))
+    Sigma_R_t = Sigma_R_t[:L]
+    print(f"Memory window L={L}/{num_steps}  (|Sigma_R| decays <1e-3 by step "
+          f"{_decay(1e-3)}, <1e-4 by {_decay(1e-4)})")
 
     n_batches = n_total // batch_size
     batched_keys = keys[:n_batches * batch_size].reshape(n_batches, batch_size, -1)
