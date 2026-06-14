@@ -49,7 +49,6 @@ os.environ["JAX_LOG_LEVEL"] = "error"
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.scipy.special import gamma
 from initial_samplings import discrete_spin_sampling_factorized, cavity_wigner_sampling
 
 # =====================================================================
@@ -62,14 +61,22 @@ def compute_explicit_bath_kernels(num_steps: int, dt: float, omega_0: float, alp
                                   w_max: float = 40.0, N_w: int = 5000) -> tuple:
     """Build the retarded memory kernel and noise spectrum for the cavity bath.
 
-    The bath spectral density is the Ohmic-family form (notes Eq. 17),
+    Full (non-RWA) position-coupling bath: the cavity couples to the bath via the
+    X quadrature, (a + a^dag) sum_k g_k (b_k + b_k^dag), keeping the counter-rotating
+    terms. The bath spectral density is the Ohmic-family form (notes Eq. 17),
         J(omega) = alpha * omega_c * (omega / omega_c)**s * exp(-omega / omega_c),  omega > 0,
     from which we compute:
 
-    * Sigma_R(t) = -i ∫_0^inf dw J(w) exp(-i w t)      (retarded self-energy, Eq. 18)
-    * the per-frequency noise amplitude sqrt( J(w) coth(w / 2T) dw / 2 ) used to
-      synthesize the colored noise xi(t) whose target correlation is
-      <xi(t) xi*(t')> = ∫_0^inf dw J(w) coth(w / 2T) exp(-i w (t - t'))  (Eq. 19).
+    * the real Caldeira-Leggett friction kernel
+          Sigma_R(t) = -2 theta(t) int_0^inf dw J(w) sin(w t),
+      whose Fourier transform has Im Sigma_R(w) = -pi J(w) (dissipation) AND a
+      nonzero real part Lambda(w) (the collective Lamb shift from the counter-
+      rotating terms, which renormalizes omega_0 and shifts g_c). It acts on the
+      X = psi_c + psi_c* quadrature.
+    * the per-frequency noise amplitude sqrt( 2 J(w) coth(w / 2T) dw ) for the real
+      bath force xi(t) on that quadrature, with target correlation
+          <xi(t) xi(t')> = 2 int_0^inf dw J(w) coth(w / 2T) cos(w (t - t')),
+      FDT-consistent with the friction kernel.
 
     Parameters
     ----------
@@ -95,9 +102,9 @@ def compute_explicit_bath_kernels(num_steps: int, dt: float, omega_0: float, alp
     Returns
     -------
     Sigma_R_t : complex128 array, shape (num_steps,)
-        Retarded self-energy kernel sampled at the simulation time grid.
+        Real friction kernel (stored as complex128 for the solver) at the time grid.
     amp_full : float64 array, shape (N_w,)
-        Noise amplitude sqrt(J(w) coth(w/2T) dw / 2) on the *full* (signed) w grid.
+        Noise amplitude sqrt(2 J(w) coth(w/2T) dw) on the *full* (signed) w grid.
     w_grid : float64 array, shape (N_w,)
         The signed frequency grid [-w_max, w_max].
     dw : float
@@ -107,18 +114,20 @@ def compute_explicit_bath_kernels(num_steps: int, dt: float, omega_0: float, alp
     dw = w_grid[1] - w_grid[0]
     J_w_pos = jnp.where(w_grid > 1e-10, alpha * omega_c * (w_grid/omega_c)**s * jnp.exp(-w_grid/omega_c), 0.0)
 
-    # [A1] Analytic retarded self-energy: the half-sided Fourier transform of the
-    # Ohmic-family J(omega) has the exact closed form
-    #     Sigma_R(t) = -i alpha omega_c^2 Gamma(s+1) / (1 + i omega_c t)^(s+1).
-    # This is machine-exact and avoids the Riemann-sum / frequency-aliasing error
-    # of the previous grid quadrature (which grew as dw * t_max approached pi).
+    # [Full / non-RWA] Real Caldeira-Leggett friction kernel
+    #     Sigma_R(t) = -2 theta(t) int_0^inf dw J(w) sin(w t).
+    # J(w) > 0 only for w > 0, so the sin-transform over the full grid picks out the
+    # positive-frequency integral. Im Sigma_R(w) = -pi J(w) (dissipation); its real
+    # part is the Lamb shift Lambda(w) from the counter-rotating terms.
     t_grid = jnp.arange(num_steps) * dt
-    Sigma_R_t = -1j * alpha * omega_c**2 * gamma(s + 1.0) / (1.0 + 1j * omega_c * t_grid)**(s + 1.0)
+    Sigma_R_t = (-2.0 * jnp.dot(jnp.sin(t_grid[:, None] * w_grid[None, :]), J_w_pos) * dw
+                 ).astype(jnp.complex128)
 
-    # [A3] Guard against the 0 * inf -> NaN at omega = 0 (coth diverges while J
-    # vanishes). Only frequencies with J(omega) > 0 contribute to the noise.
+    # [A3] FDT-consistent real bath-noise amplitude on the X quadrature; the factor
+    # 2 follows from S_xi(w) = coth(w/2T) * (-2 Im Sigma_R(w)). The where() guards
+    # the 0 * inf -> NaN at w = 0 (coth diverges while J vanishes).
     coth_w = 1.0 / jnp.tanh(w_grid / (2.0 * T + 1e-12))
-    amp_full = jnp.sqrt(jnp.where(J_w_pos > 0.0, J_w_pos * coth_w * dw / 2.0, 0.0))
+    amp_full = jnp.sqrt(jnp.where(J_w_pos > 0.0, 2.0 * J_w_pos * coth_w * dw, 0.0))
 
     return Sigma_R_t, amp_full, w_grid, dw
 
@@ -259,7 +268,11 @@ def non_markovian_coupled_heun_step(S_history: jax.Array, alpha_history: jax.Arr
         weights = jnp.where(block_j == target_idx, 0.5, weights)
         weights = jnp.where(target_idx == 0, 0.0, weights)
 
-        return jnp.dot(sigma_vals * weights * dt, block)
+        # [Full / non-RWA] the bath couples to the X quadrature x = psi_c + psi_c*,
+        # so the memory integral acts on (block + conj(block)) = 2 Re(psi_c), not on
+        # psi_c alone (the RWA approximation).
+        x_quad = block + jnp.conj(block)
+        return jnp.dot(sigma_vals * weights * dt, x_quad)
     # ==========================================================
 
     # --- [A2] Integrating-factor (ETDRK2) coefficients for dpsi/dt = -i w0 psi + N.
@@ -397,12 +410,12 @@ def solve_single_trajectory(key: jax.Array, omega_0: float, B_field_base: jax.Ar
     noise_re = jax.random.normal(k_re, (half_N,), dtype=jnp.float64) * amp
     noise_im = jax.random.normal(k_im, (half_N,), dtype=jnp.float64) * amp
 
-    # [P3] Synthesize the entire noise trajectory xi(t) in one pair of GEMMs
-    # against the shared trig matrices (identical to the old per-step recipe:
-    #   xi(t) = sum_k (a_k + i b_k) exp(-i w_k t),  <xi(t) xi*(t')> = -i Sigma_K).
-    xi_real = cos_wt @ noise_re + sin_wt @ noise_im
-    xi_imag = cos_wt @ noise_im - sin_wt @ noise_re
-    xi_all = jnp.where(use_noise, xi_real + 1j * xi_imag, 0.0)
+    # [Full / non-RWA] Real symmetric bath force xi(t) on the X quadrature, one GEMM
+    # against the shared trig matrices:
+    #   xi(t) = sum_k amp_k [cos(w_k t) u_k + sin(w_k t) v_k],
+    #   <xi(t) xi(t')> = 2 int_0^inf J(w) coth(w/2T) cos(w (t - t')) dw.
+    xi_t = cos_wt @ noise_re + sin_wt @ noise_im
+    xi_all = jnp.where(use_noise, xi_t.astype(jnp.complex128), 0.0)
 
     def scan_body(carry, step_idx):
         S_hist, alpha_hist = carry
