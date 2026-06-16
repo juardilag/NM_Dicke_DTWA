@@ -25,6 +25,14 @@ Re(psi_c)) over the stationary window [pulse_idx:], not the single final snapsho
 so an isolated late inter-well hop cannot flip a trajectory's whole-history label.
 """
 
+import os
+# Enable 64-bit precision BEFORE jax is imported, so importing this module first
+# (e.g. ``from fdt import ...``) cannot silently leave the simulation in float32.
+os.environ["JAX_ENABLE_X64"] = "True"
+os.environ["JAX_ENABLE_TRITON_GEMM"] = "0"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["JAX_LOG_LEVEL"] = "error"
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -112,6 +120,7 @@ def _accumulate_batch_sums(spin_ensemble: jax.Array, cavity_ensemble: jax.Array,
                                                folded stationary window, shape (N_tau,)
     """
     sx_trajs = spin_ensemble[:, :, 0] / j_val
+    sy_trajs = spin_ensemble[:, :, 1] / j_val   # transverse spin: the Gaussian mode in SR
     r_alpha_trajs = jnp.real(cavity_ensemble)
 
     # ==========================================================
@@ -120,6 +129,7 @@ def _accumulate_batch_sums(spin_ensemble: jax.Array, cavity_ensemble: jax.Array,
     # so the response delta survives the 50/50 cancellation.
     # ==========================================================
     sum_sx_raw = jnp.sum(sx_trajs, axis=0)
+    sum_sy_raw = jnp.sum(sy_trajs, axis=0)
     sum_ra_raw = jnp.sum(r_alpha_trajs, axis=0)
 
     # ==========================================================
@@ -138,20 +148,32 @@ def _accumulate_batch_sums(spin_ensemble: jax.Array, cavity_ensemble: jax.Array,
 
     sx_folded = sx_trajs * signs
     ra_folded = r_alpha_trajs * signs
+    sy_folded = sy_trajs * signs   # S_y is also Z2-odd, so it folds with the well sign
 
-    # Slice the stationary part for exact lag correlation
-    sx_stat_folded = sx_folded[:, pulse_idx:]
-    ra_stat_folded = ra_folded[:, pulse_idx:]
+    # Slice the stationary window, then subtract the ensemble mean BEFORE forming
+    # the lag products. This computes the connected correlation as
+    # <(x - <x>)(x' - <x'>)> directly, avoiding the catastrophic cancellation
+    # <x x'> - <x><x'> that wrecks precision when the mean is large (the SR-phase
+    # coherent baseline |alpha|^2). Exact for a single batch (batch_size = n_total).
+    sx_stat = sx_folded[:, pulse_idx:]
+    sy_stat = sy_folded[:, pulse_idx:]
+    ra_stat = ra_folded[:, pulse_idx:]
+    sx_fluc = sx_stat - jnp.mean(sx_stat, axis=0, keepdims=True)
+    sy_fluc = sy_stat - jnp.mean(sy_stat, axis=0, keepdims=True)
+    ra_fluc = ra_stat - jnp.mean(ra_stat, axis=0, keepdims=True)
 
-    sum_corr_sx_folded = compute_exact_lag_correlation(sx_stat_folded)
-    sum_corr_ra_folded = compute_exact_lag_correlation(ra_stat_folded)
+    sum_corr_sx_folded = compute_exact_lag_correlation(sx_fluc)
+    sum_corr_sy_folded = compute_exact_lag_correlation(sy_fluc)
+    sum_corr_ra_folded = compute_exact_lag_correlation(ra_fluc)
 
     return {
         "sum_sx_raw": sum_sx_raw,
+        "sum_sy_raw": sum_sy_raw,
         "sum_ra_raw": sum_ra_raw,
         "sum_sx_folded": jnp.sum(sx_folded, axis=0),
         "sum_ra_folded": jnp.sum(ra_folded, axis=0),
         "sum_corr_sx": sum_corr_sx_folded,
+        "sum_corr_sy": sum_corr_sy_folded,
         "sum_corr_ra": sum_corr_ra_folded
     }
 
@@ -162,7 +184,7 @@ def _compiled_master_processor(
     n_spins: int, dt: float, num_steps: int,
     Sigma_R_t: jax.Array, cos_wt: jax.Array, sin_wt: jax.Array, amp: jax.Array,
     use_noise: bool, use_sampling: bool,
-    pulse_idx: int, epsilon_spin: float, epsilon_cavity: float
+    pulse_idx: int, epsilon_spin: float, epsilon_cavity: float, epsilon_spin_y: float = 0.0
 ) -> dict:
     """vmap+scan driver accumulating the raw/folded sums for one full ensemble.
 
@@ -191,7 +213,7 @@ def _compiled_master_processor(
 
     vmap_solver = jax.vmap(
         solve_single_trajectory,
-        in_axes=(0, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
+        in_axes=(0, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
     )
 
     def master_scan_body(carry_stats, current_batch_keys):
@@ -202,7 +224,7 @@ def _compiled_master_processor(
             n_spins, dt, num_steps,
             Sigma_R_t, cos_wt, sin_wt, amp,
             use_noise, use_sampling,
-            pulse_idx, epsilon_spin, epsilon_cavity
+            pulse_idx, epsilon_spin, epsilon_cavity, epsilon_spin_y
         )
 
         batch_sums = _accumulate_batch_sums(batch_S, batch_alpha, j_val, pulse_idx)
@@ -211,10 +233,12 @@ def _compiled_master_processor(
 
     init_stats = {
         "sum_sx_raw": jnp.zeros(num_steps),
+        "sum_sy_raw": jnp.zeros(num_steps),
         "sum_ra_raw": jnp.zeros(num_steps),
         "sum_sx_folded": jnp.zeros(num_steps),
         "sum_ra_folded": jnp.zeros(num_steps),
         "sum_corr_sx": jnp.zeros(N_tau),
+        "sum_corr_sy": jnp.zeros(N_tau),
         "sum_corr_ra": jnp.zeros(N_tau)
     }
 
@@ -225,15 +249,15 @@ def _compiled_master_processor(
 # 3. SPECTRAL TRANSFORMS
 # =====================================================================
 
-@jax.jit
+@jax.jit(static_argnames=['taper_frac'])
 def compute_spectra(C_tau: jax.Array, chi_tau: jax.Array, dt: float,
-                    w_grid: jax.Array, eta: float = 0.01) -> tuple:
+                    w_grid: jax.Array, eta: float = 0.01, taper_frac: float = 0.5) -> tuple:
     """Fourier-transform C(tau) and chi(tau) into S(omega) and Im chi(omega).
 
     Uses a one-sided transform with: an artificial broadening exp(-eta tau)
-    (Lorentzian smoothing / regularization), a half-window cosine taper to
-    suppress truncation ringing, Simpson quadrature weights, and DC removal
-    (subtracting the tail mean) to kill spurious zero-frequency weight.
+    (Lorentzian smoothing / regularization), a Tukey cosine taper to suppress
+    truncation ringing and spectral leakage, Simpson quadrature weights, and DC
+    removal (subtracting the tail mean) to kill spurious zero-frequency weight.
 
     Parameters
     ----------
@@ -247,6 +271,14 @@ def compute_spectra(C_tau: jax.Array, chi_tau: jax.Array, dt: float,
         Output angular-frequency grid.
     eta : float, optional
         Spectral broadening (inverse decay time of the smoothing kernel).
+    taper_frac : float, optional
+        Tukey-window flat fraction: the leading ``taper_frac`` of the lag axis is
+        left untapered and the remaining ``1 - taper_frac`` is rolled off by a
+        raised cosine (always 1 at tau=0 to preserve the variance, 0 at the end).
+        ``0.5`` (default) tapers only the last half; ``0.0`` tapers the whole
+        range for maximum sidelobe suppression -- use it for gapped observables
+        (e.g. the spin) whose strong peak otherwise leaks into the empty
+        low-frequency band.
 
     Returns
     -------
@@ -261,9 +293,12 @@ def compute_spectra(C_tau: jax.Array, chi_tau: jax.Array, dt: float,
     # This transforms exp(-1j * w * t) into exp(-1j * w * t) * exp(-eta * t)
     exp_kernel = jnp.exp(-1j * (w_grid[:, None] - 1j * eta) * tau_grid[None, :])
 
-    taper_start = int(0.5 * N)
+    # Tukey taper: flat over the leading taper_frac, raised-cosine roll-off after
+    # (1 at tau=0, 0 at tau_max). Wider roll-off -> lower spectral-leakage floor.
+    taper_start = int(taper_frac * N)
+    n_dec = max(N - taper_start, 1)
     taper = jnp.ones(N)
-    cos_taper = 0.5 * (1.0 + jnp.cos(jnp.pi * (jnp.arange(N - taper_start) / (N - taper_start))))
+    cos_taper = 0.5 * (1.0 + jnp.cos(jnp.pi * (jnp.arange(n_dec) / max(n_dec - 1, 1))))
     taper = taper.at[taper_start:].set(cos_taper)
 
     idx = jnp.arange(N)
@@ -374,56 +409,36 @@ def calculate_correlations_and_responses(keys: jax.Array, t_grid: jax.Array, p: 
 
     batched_keys = keys[:(n_total // p['batch_size']) * p['batch_size']].reshape(-1, p['batch_size'], 2)
 
-    print("Pass 1/3: Base...")
-    res_base = _compiled_master_processor(
-        batched_keys,
-        p['omega_0'], B_base, p['g'], p['n_photons_initial'], p['initial_direction'],
-        p['n_spins'], dt, num_steps,
-        Sigma_R_t, cos_wt, sin_wt, amp,
-        True, True,
-        pulse_idx, 0.0, 0.0
-    )
+    def _run(eps_spin, eps_cav, eps_spin_y, label):
+        print(label)
+        return _compiled_master_processor(
+            batched_keys,
+            p['omega_0'], B_base, p['g'], p['n_photons_initial'], p['initial_direction'],
+            p['n_spins'], dt, num_steps,
+            Sigma_R_t, cos_wt, sin_wt, amp,
+            True, True,
+            pulse_idx, eps_spin, eps_cav, eps_spin_y
+        )
 
-    print("Pass 2/3: Spin perturbation...")
-    res_pert_spin = _compiled_master_processor(
-        batched_keys,
-        p['omega_0'], B_base, p['g'], p['n_photons_initial'], p['initial_direction'],
-        p['n_spins'], dt, num_steps,
-        Sigma_R_t, cos_wt, sin_wt, amp,
-        True, True,
-        pulse_idx, epsilon, 0.0
-    )
+    res_base     = _run(0.0,     0.0,     0.0,     "Pass 1/4: Base...")
+    res_pert_spin = _run(epsilon, 0.0,     0.0,     "Pass 2/4: Spin (S_x) perturbation...")
+    res_pert_cav = _run(0.0,     epsilon, 0.0,     "Pass 3/4: Cavity perturbation...")
+    res_pert_sy  = _run(0.0,     0.0,     epsilon, "Pass 4/4: Transverse spin (S_y) perturbation...")
 
-    print("Pass 3/3: Cavity perturbation...")
-    res_pert_cav = _compiled_master_processor(
-        batched_keys,
-        p['omega_0'], B_base, p['g'], p['n_photons_initial'], p['initial_direction'],
-        p['n_spins'], dt, num_steps,
-        Sigma_R_t, cos_wt, sin_wt, amp,
-        True, True,
-        pulse_idx, 0.0, epsilon
-    )
-
-    # === Correlations (Use FOLDED track) ===
-    # We use the folded means to correctly subtract the massive broken-symmetry baseline
-    mean_sx_folded = res_base["sum_sx_folded"] / n_total
-    mean_ra_folded = res_base["sum_ra_folded"] / n_total
-
-    mean_sx_stat_folded = mean_sx_folded[pulse_idx:]
-    mean_ra_stat_folded = mean_ra_folded[pulse_idx:]
-
-    mean_sx_corr = compute_exact_lag_correlation(mean_sx_stat_folded)
-    mean_ra_corr = compute_exact_lag_correlation(mean_ra_stat_folded)
-
+    # === Correlations (FOLDED track) ===
+    # The mean is already subtracted inside _accumulate_batch_sums (connected,
+    # numerically stable), so here we just normalize by the per-lag sample count.
     counts = N_tau - jnp.arange(N_tau)
     counts = jnp.where(counts > 0, counts, 1.0)
 
-    C_spin = ((res_base["sum_corr_sx"] / n_total) - mean_sx_corr) / counts
-    C_cavity = (4.0 / j_val) * ((res_base["sum_corr_ra"] / n_total) - mean_ra_corr) / counts
+    C_spin = (res_base["sum_corr_sx"] / n_total) / counts
+    C_spin_y = (res_base["sum_corr_sy"] / n_total) / counts
+    C_cavity = (4.0 / j_val) * (res_base["sum_corr_ra"] / n_total) / counts
 
     # === Responses (Use RAW track) ===
     # We use the raw, un-folded sums so the +/- response deltas don't cancel each other out
     response_spin = ((res_pert_spin["sum_sx_raw"] - res_base["sum_sx_raw"]) / n_total)[pulse_idx:] / (epsilon * j_val)
+    response_spin_y = ((res_pert_sy["sum_sy_raw"] - res_base["sum_sy_raw"]) / n_total)[pulse_idx:] / (epsilon * j_val)
     response_cavity = 2.0 * ((res_pert_cav["sum_ra_raw"] - res_base["sum_ra_raw"]) / n_total)[pulse_idx:] / (epsilon * j_val)
 
     # === Spectra ===
@@ -432,8 +447,36 @@ def calculate_correlations_and_responses(keys: jax.Array, t_grid: jax.Array, p: 
     w_grid = jnp.geomspace(w_min, w_max, N_w)
 
     print("Fourier transforms...")
-    S_c_spin, S_chi_spin = compute_spectra(np.array(C_spin), np.array(response_spin), dt, w_grid, eta=1e-4)
-    S_c_cavity, S_chi_cavity = compute_spectra(np.array(C_cavity), np.array(response_cavity), dt, w_grid, eta=1e-3)
+    # S_x is gapped/pinned (especially in SR); a full-range Tukey taper
+    # (taper_frac=0.0) suppresses spectral leakage. The transverse S_y is the
+    # Gaussian mode in SR and carries the meaningful FDT signal there.
+    S_c_spin, S_chi_spin = compute_spectra(np.array(C_spin), np.array(response_spin), dt, w_grid,
+                                           eta=1e-4, taper_frac=0.0)
+    S_c_spin_y, S_chi_spin_y = compute_spectra(np.array(C_spin_y), np.array(response_spin_y), dt, w_grid,
+                                               eta=1e-4, taper_frac=0.0)
+    S_c_cavity, S_chi_cavity = compute_spectra(np.array(C_cavity), np.array(response_cavity), dt, w_grid,
+                                               eta=1e-3, taper_frac=0.5)
+
+    # === Quantum (non-symmetric) correlator via the response correction ===
+    # Appendix C of Hosseinabadi, Chelpanova & Marino, PRX Quantum 6, 030344 (2025):
+    # TWA gives the SYMMETRIZED correlator directly; the full (non-symmetric)
+    # quantum correlator is recovered by adding the commutator/response part,
+    #     <A(tau)A(0)> = C_sym(tau) - (i/2) chi(tau)        (tau > 0),
+    # yielding the physically-observable emission/absorption (greater/lesser)
+    # spectra
+    #     S^>(w) = S_sym(w) + A(w)/2,   S^<(w) = S_sym(w) - A(w)/2,
+    # with S_sym = S_c/2 (our double-sided convention), A = -2 Im chi = 2 R, and R
+    # the physical dissipative response (= +S_chi for the cavity kick, = -S_chi for
+    # the spin kicks, matching the FDT-ratio sign convention).
+    def _quantum(C, response, S_c, S_chi, sign):
+        S_sym = 0.5 * np.asarray(S_c)
+        R = sign * np.asarray(S_chi)
+        C_q = np.asarray(C) - 0.5j * (sign * np.asarray(response))   # <A(tau)A(0)>
+        return C_q, S_sym + R, S_sym - R                            # C_quantum, S^>, S^<
+
+    Cq_sx, Sgt_sx, Slt_sx = _quantum(C_spin, response_spin, S_c_spin, S_chi_spin, -1.0)
+    Cq_sy, Sgt_sy, Slt_sy = _quantum(C_spin_y, response_spin_y, S_c_spin_y, S_chi_spin_y, -1.0)
+    Cq_ca, Sgt_ca, Slt_ca = _quantum(C_cavity, response_cavity, S_c_cavity, S_chi_cavity, +1.0)
 
     print("Done!")
 
@@ -441,11 +484,19 @@ def calculate_correlations_and_responses(keys: jax.Array, t_grid: jax.Array, p: 
         "tau_grid": tau_grid,
         "w_grid": np.array(w_grid),
         "C_spin": np.array(C_spin),
+        "C_spin_y": np.array(C_spin_y),
         "C_cavity": np.array(C_cavity),
         "response_spin": np.array(response_spin),
+        "response_spin_y": np.array(response_spin_y),
         "response_cavity": np.array(response_cavity),
         "S_c_spin": np.array(S_c_spin),
         "S_chi_spin": np.array(S_chi_spin),
+        "S_c_spin_y": np.array(S_c_spin_y),
+        "S_chi_spin_y": np.array(S_chi_spin_y),
         "S_c_cavity": np.array(S_c_cavity),
-        "S_chi_cavity": np.array(S_chi_cavity)
+        "S_chi_cavity": np.array(S_chi_cavity),
+        # Quantum (non-symmetric) correlators and emission/absorption spectra
+        "C_quantum_spin": Cq_sx, "S_greater_spin": Sgt_sx, "S_lesser_spin": Slt_sx,
+        "C_quantum_spin_y": Cq_sy, "S_greater_spin_y": Sgt_sy, "S_lesser_spin_y": Slt_sy,
+        "C_quantum_cavity": Cq_ca, "S_greater_cavity": Sgt_ca, "S_lesser_cavity": Slt_ca,
     }

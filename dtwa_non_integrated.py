@@ -332,7 +332,8 @@ def solve_single_trajectory(key: jax.Array, omega_0: float, B_field_base: jax.Ar
                             alpha_shift: complex, initial_direction: jax.Array, n_spins: int,
                             dt: float, num_steps: int, Sigma_R_t: jax.Array, cos_wt: jax.Array,
                             sin_wt: jax.Array, amp: jax.Array, use_noise: bool, use_sampling: bool,
-                            pulse_idx: int, epsilon_spin: float, epsilon_cavity: float) -> tuple:
+                            pulse_idx: int, epsilon_spin: float, epsilon_cavity: float,
+                            epsilon_spin_y: float = 0.0) -> tuple:
     """Integrate a single coupled spin+cavity DTWA trajectory.
 
     Samples an initial spin (discrete Wigner) and cavity amplitude (Gaussian
@@ -438,12 +439,15 @@ def solve_single_trajectory(key: jax.Array, omega_0: float, B_field_base: jax.Ar
         # EXACT ANALYTICAL JUMPS (impulsive linear-response perturbation)
         # ==========================================================
         is_pulse = (step_idx == pulse_idx)
-        cos_e = jnp.cos(epsilon_spin)
-        sin_e = jnp.sin(epsilon_spin)
-
-        S_y_jumped = current_S[1] * cos_e - current_S[2] * sin_e
-        S_z_jumped = current_S[2] * cos_e + current_S[1] * sin_e
-        S_jumped = jnp.array([current_S[0], S_y_jumped, S_z_jumped])
+        # x-rotation (impulsive B_x field): rotates y,z, leaves S_x -> probes chi_xx
+        cx, sx = jnp.cos(epsilon_spin), jnp.sin(epsilon_spin)
+        Sy1 = current_S[1] * cx - current_S[2] * sx
+        Sz1 = current_S[2] * cx + current_S[1] * sx
+        # y-rotation (impulsive B_y field): rotates x,z, leaves S_y -> probes chi_yy
+        cy, sy = jnp.cos(epsilon_spin_y), jnp.sin(epsilon_spin_y)
+        Sx2 = current_S[0] * cy + Sz1 * sy
+        Sz2 = -current_S[0] * sy + Sz1 * cy
+        S_jumped = jnp.array([Sx2, Sy1, Sz2])
 
         current_S = jnp.where(is_pulse, S_jumped, current_S)
         alpha_jumped = current_alpha + 1j * epsilon_cavity
@@ -544,7 +548,8 @@ def _compiled_master_processor(batched_keys: jax.Array, omega_0: float, B_field_
                                n_photons_initial: complex, initial_direction: jax.Array, n_spins: int,
                                dt: float, num_steps: int, Sigma_R_t: jax.Array, cos_wt: jax.Array,
                                sin_wt: jax.Array, amp: jax.Array, use_noise: bool, use_sampling: bool,
-                               pulse_idx: int, epsilon_spin: float, epsilon_cavity: float) -> dict:
+                               pulse_idx: int, epsilon_spin: float, epsilon_cavity: float,
+                               epsilon_spin_y: float = 0.0) -> dict:
     """vmap over trajectories and scan over batches, accumulating ensemble sums.
 
     Vectorizes :func:`solve_single_trajectory` across one batch of keys, reduces
@@ -572,14 +577,14 @@ def _compiled_master_processor(batched_keys: jax.Array, omega_0: float, B_field_
     j_val = n_spins / 2.0
     vmap_solver = jax.vmap(
         solve_single_trajectory,
-        in_axes=(0, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
+        in_axes=(0, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
     )
 
     def master_scan_body(carry_stats, current_batch_keys):
         batch_S, batch_alpha = vmap_solver(
             current_batch_keys, omega_0, B_field_safe, g, n_photons_initial, initial_direction,
             n_spins, dt, num_steps, Sigma_R_t, cos_wt, sin_wt, amp,
-            use_noise, use_sampling, pulse_idx, epsilon_spin, epsilon_cavity
+            use_noise, use_sampling, pulse_idx, epsilon_spin, epsilon_cavity, epsilon_spin_y
         )
         batch_sums = _accumulate_batch_sums(batch_S, batch_alpha, j_val)
         next_carry = {key: carry_stats[key] + batch_sums[key] for key in carry_stats}
@@ -604,7 +609,7 @@ def run_dtwa(keys: jax.Array, t_grid: jax.Array, omega_0: float, alpha: float, o
              initial_direction: jax.Array, batch_size: int = 1000, n_spins: int = 1,
              w_max: float = 40.0, N_w: int = 5000, use_noise: bool = True, use_sampling: bool = True,
              pulse_idx: int = -1, epsilon_spin: float = 0.0, epsilon_cavity: float = 0.0,
-             mem_window: int = None) -> dict:
+             mem_window: int = None, epsilon_spin_y: float = 0.0) -> dict:
     """Top-level driver: run the full DTWA ensemble and return ensemble averages.
 
     Builds the bath kernels, batches the supplied RNG keys, runs the compiled
@@ -712,7 +717,7 @@ def run_dtwa(keys: jax.Array, t_grid: jax.Array, omega_0: float, alpha: float, o
     running_stats = _compiled_master_processor(
         batched_keys, omega_0, B_field_safe, g, n_photons_initial, initial_direction,
         n_spins, dt, num_steps, Sigma_R_t, cos_wt, sin_wt, amp,
-        use_noise, use_sampling, pulse_idx, epsilon_spin, epsilon_cavity
+        use_noise, use_sampling, pulse_idx, epsilon_spin, epsilon_cavity, epsilon_spin_y
     )
 
     final_stats = {
