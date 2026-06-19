@@ -107,3 +107,34 @@ def cavity_wigner_sampling(key: jax.Array, alpha_initial: complex) -> jax.Array:
     alpha_0 = jnp.array(alpha_initial, dtype=jnp.complex128)
 
     return alpha_0 + fluc_re + 1j * fluc_im
+
+
+def discrete_cavity_sampling(key: jax.Array, alpha_initial: complex) -> jax.Array:
+    """Discrete-Wigner sampling of the initial cavity amplitude.
+
+    Like :func:`cavity_wigner_sampling` but each quadrature is drawn from the
+    two-point distribution +/- sqrt(1/2) instead of a Gaussian. This reproduces
+    the coherent-state Wigner mean (0) and variance (1/2 per quadrature) exactly
+    while suppressing the large-deviation tails, which can reduce the estimator
+    variance of two-point correlators -- the same rationale as discrete TWA for
+    spin-1/2 (Schachenmayer et al.). Higher moments differ from the true Gaussian,
+    so it is an approximation that trades tail fidelity for lower sampling noise.
+
+    Parameters
+    ----------
+    key : jax.Array
+        JAX PRNGKey (split internally for the two quadratures).
+    alpha_initial : complex
+        Mean initial cavity amplitude.
+
+    Returns
+    -------
+    alpha_0 : jax.Array, complex128 scalar
+        ``alpha_initial + (+/- sqrt(1/2)) + i (+/- sqrt(1/2))``.
+    """
+    k1, k2 = jax.random.split(key)
+    amp = jnp.sqrt(0.5)
+    fluc_re = (2.0 * jax.random.bernoulli(k1, p=0.5) - 1.0) * amp
+    fluc_im = (2.0 * jax.random.bernoulli(k2, p=0.5) - 1.0) * amp
+    alpha_0 = jnp.array(alpha_initial, dtype=jnp.complex128)
+    return alpha_0 + fluc_re + 1j * fluc_im
