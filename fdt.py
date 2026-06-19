@@ -408,7 +408,8 @@ def compute_spectra(C_tau: jax.Array, chi_tau: jax.Array, dt: float,
 
 def calculate_correlations_and_responses(keys: jax.Array, t_grid: jax.Array, p: dict, t_pulse: float,
                                          epsilon: float = 1e-5, w_max: float = 20.0, N_w: int = 5000,
-                                         mem_window: int = None, post_select: bool = False) -> dict:
+                                         mem_window: int = None, post_select: bool = False,
+                                         eta_spin: float = 5e-2, eta_cavity: float = 1e-3) -> dict:
     """Measure C(tau), chi(tau) and their spectra for spin and cavity observables.
 
     Runs three ensembles that share the same RNG keys -- a base run, a spin-kicked
@@ -570,12 +571,19 @@ def calculate_correlations_and_responses(keys: jax.Array, t_grid: jax.Array, p: 
     # S_x is gapped/pinned (especially in SR); a full-range Tukey taper
     # (taper_frac=0.0) suppresses spectral leakage. The transverse S_y is the
     # Gaussian mode in SR and carries the meaningful FDT signal there.
+    #
+    # The spin response is sharply peaked at the polaritons with ~zero weight
+    # between, so a small eta leaves the FDT ratio defined only in narrow bands.
+    # A larger ``eta_spin`` broadens the peaks (applied identically to S_c and
+    # S_chi, so the ratio is preserved) until their tails overlap and the ratio
+    # becomes a continuous curve across the spectrum. The cavity is intrinsically
+    # broad, so it needs far less (``eta_cavity``).
     S_c_spin, S_chi_spin = compute_spectra(np.array(C_spin), np.array(response_spin), dt, w_grid,
-                                           eta=1e-4, taper_frac=0.0)
+                                           eta=eta_spin, taper_frac=0.0)
     S_c_spin_y, S_chi_spin_y = compute_spectra(np.array(C_spin_y), np.array(response_spin_y), dt, w_grid,
-                                               eta=1e-4, taper_frac=0.0)
+                                               eta=eta_spin, taper_frac=0.0)
     S_c_cavity, S_chi_cavity = compute_spectra(np.array(C_cavity), np.array(response_cavity), dt, w_grid,
-                                               eta=1e-3, taper_frac=0.5)
+                                               eta=eta_cavity, taper_frac=0.5)
 
     print("Done!")
 
