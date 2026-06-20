@@ -39,8 +39,7 @@ import jax.numpy as jnp
 
 from dtwa_non_integrated import (
     solve_single_trajectory,
-    compute_explicit_bath_kernels,
-    precompute_solver_arrays
+    _resolve_bath_config,
 )
 
 # Minimum fraction of single-well trajectories below which post-selection is
@@ -211,15 +210,21 @@ def _accumulate_batch_sums(spin_ensemble: jax.Array, cavity_ensemble: jax.Array,
     }
 
 @jax.jit(static_argnames=['n_spins', 'num_steps', 'use_noise', 'use_sampling', 'pulse_idx',
-                          'post_select', 'use_external_mask'])
+                          'post_select', 'use_external_mask',
+                          'cav_markovian', 'cav_rwa', 'rwa_interaction',
+                          'spin_bath_on', 'spin_markovian', 'spin_axis'])
 def _compiled_master_processor(
     batched_keys: jax.Array, ext_mask_batched: jax.Array,
     omega_0: float, B_field_safe: jax.Array, g: float, n_photons_initial: complex, initial_direction: jax.Array,
     n_spins: int, dt: float, num_steps: int,
-    Sigma_R_t: jax.Array, cos_wt: jax.Array, sin_wt: jax.Array, amp: jax.Array,
+    Sigma_R_cav: jax.Array, Sigma_R_spin: jax.Array, cos_wt: jax.Array, sin_wt: jax.Array,
+    amp_cav: jax.Array, amp_spin: jax.Array,
+    kappa_cav: float, kappa_spin: float, white_D_cav: float, white_D_spin: float, Szeq: float,
     use_noise: bool, use_sampling: bool,
     pulse_idx: int, epsilon_spin: float, epsilon_cavity: float, epsilon_spin_y: float = 0.0,
-    post_select: bool = False, use_external_mask: bool = False
+    post_select: bool = False, use_external_mask: bool = False,
+    cav_markovian: bool = False, cav_rwa: bool = False, rwa_interaction: bool = False,
+    spin_bath_on: bool = False, spin_markovian: bool = False, spin_axis: int = 0,
 ) -> tuple:
     """vmap+scan driver accumulating the raw/folded sums for one full ensemble.
 
@@ -270,22 +275,23 @@ def _compiled_master_processor(
     j_val = n_spins / 2.0
     N_tau = num_steps - pulse_idx
 
-    vmap_solver = jax.vmap(
-        solve_single_trajectory,
-        in_axes=(0, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
-    )
+    def solve_one(key):
+        return solve_single_trajectory(
+            key, omega_0, B_field_safe, g, n_photons_initial, initial_direction,
+            n_spins, dt, num_steps,
+            Sigma_R_cav, Sigma_R_spin, cos_wt, sin_wt, amp_cav, amp_spin,
+            kappa_cav, kappa_spin, white_D_cav, white_D_spin, Szeq,
+            use_noise, use_sampling,
+            pulse_idx, epsilon_spin, epsilon_cavity, epsilon_spin_y,
+            cav_markovian, cav_rwa, rwa_interaction,
+            spin_bath_on, spin_markovian, spin_axis)
+
+    vmap_solver = jax.vmap(solve_one)
 
     def master_scan_body(carry_stats, scan_inputs):
         current_batch_keys, batch_ext_mask = scan_inputs
 
-        batch_S, batch_alpha = vmap_solver(
-            current_batch_keys,
-            omega_0, B_field_safe, g, n_photons_initial, initial_direction,
-            n_spins, dt, num_steps,
-            Sigma_R_t, cos_wt, sin_wt, amp,
-            use_noise, use_sampling,
-            pulse_idx, epsilon_spin, epsilon_cavity, epsilon_spin_y
-        )
+        batch_S, batch_alpha = vmap_solver(current_batch_keys)
 
         # Single-well flag: S_x keeps a constant sign over the measurement window.
         sx_stat = batch_S[:, pulse_idx:, 0]
@@ -469,28 +475,43 @@ def calculate_correlations_and_responses(keys: jax.Array, t_grid: jax.Array, p: 
     j_val = p['n_spins'] / 2.0
     N_tau = num_steps - pulse_idx
 
-    B_base = jnp.zeros((num_steps, 3)).at[:, 2].set(p.get('B_z', 0.0))
+    B_z_val = p.get('B_z', 0.0)
+    B_base = jnp.zeros((num_steps, 3)).at[:, 2].set(B_z_val)
 
-    # ✅ NEW KERNEL PIPELINE
-    Sigma_R_t, amp_full, w_grid_full, dw = compute_explicit_bath_kernels(
-        num_steps, dt,
-        p['omega_0'], p['alpha'], p['omega_c'], p['s'], p['T'],
-        w_max, N_w
-    )
+    # --- Bath / interaction selection (read from p, defaulting to the original
+    #     cavity-only, non-Markovian, full-coupling, Dicke setup) ---
+    cav_markovian = bool(p.get('cavity_bath_markovian', False))
+    cav_rwa = bool(p.get('rwa_cavity_bath', False))
+    rwa_interaction = bool(p.get('rwa_interaction', False))
+    spin_markovian = bool(p.get('spin_bath_markovian', False))
 
-    Sigma_R_t, t_grid_pre, cos_wt, sin_wt, amp = precompute_solver_arrays(
-        num_steps, dt, Sigma_R_t, amp_full, dw, w_grid_full
-    )
+    # Build both bath kernels + shared trig matrices.
+    cfg = _resolve_bath_config(
+        p['omega_0'], p['alpha'], p['omega_c'], p['s'], p['T'], B_z_val,
+        p['n_spins'], dt, num_steps, w_max, N_w,
+        cav_markovian, cav_rwa,
+        p.get('alpha_spin', 0.0), p.get('omega_c_spin', None), p.get('s_spin', None),
+        p.get('T_spin', None), spin_markovian, p.get('rwa_spin_bath', False),
+        p.get('spin_bath_channel', 'transverse'))
+    Sig_cav, Sig_spin = cfg["Sigma_R_cav"], cfg["Sigma_R_spin"]
+    spin_bath_on, spin_axis = cfg["spin_bath_on"], cfg["spin_axis"]
 
-    # [P1] Memory-window truncation (None -> full, exact). The same truncated
-    # kernel is shared by all three passes.
-    mag = np.abs(np.asarray(Sigma_R_t)); mag = mag / (mag[0] + 1e-300)
-    def _decay(tol):
-        idx = int(np.argmax(mag < tol)); return idx if idx > 0 else num_steps
-    L = num_steps if mem_window is None else int(min(mem_window, num_steps))
-    Sigma_R_t = Sigma_R_t[:L]
-    print(f"Memory window L={L}/{num_steps}  (|Sigma_R| <1e-3 by step "
-          f"{_decay(1e-3)}, <1e-4 by {_decay(1e-4)})")
+    # [P1] Memory-window truncation (None -> full, exact). Shared by all passes.
+    if not cav_markovian:
+        mag = np.abs(np.asarray(Sig_cav)); mag = mag / (mag[0] + 1e-300)
+        def _decay(tol):
+            idx = int(np.argmax(mag < tol)); return idx if idx > 0 else num_steps
+        L = num_steps if mem_window is None else int(min(mem_window, num_steps))
+        Sig_cav = Sig_cav[:L]
+        print(f"Memory window L={L}/{num_steps}  (|Sigma_R^cav| <1e-3 by step "
+              f"{_decay(1e-3)}, <1e-4 by {_decay(1e-4)})")
+    else:
+        Sig_cav = Sig_cav[:1]
+        print(f"Cavity bath: MARKOVIAN (kappa={cfg['kappa_cav']:.4g})")
+    if spin_bath_on and not spin_markovian:
+        Sig_spin = Sig_spin[:max(Sig_cav.shape[0], 1)]
+    else:
+        Sig_spin = Sig_spin[:1]
 
     n_used = (n_total // p['batch_size']) * p['batch_size']
     batched_keys = keys[:n_used].reshape(-1, p['batch_size'], 2)
@@ -502,10 +523,13 @@ def calculate_correlations_and_responses(keys: jax.Array, t_grid: jax.Array, p: 
             batched_keys, ext_mask,
             p['omega_0'], B_base, p['g'], p['n_photons_initial'], p['initial_direction'],
             p['n_spins'], dt, num_steps,
-            Sigma_R_t, cos_wt, sin_wt, amp,
+            Sig_cav, Sig_spin, cfg["cos_wt"], cfg["sin_wt"], cfg["amp_cav"], cfg["amp_spin"],
+            cfg["kappa_cav"], cfg["kappa_spin"], cfg["white_D_cav"], cfg["white_D_spin"], cfg["Szeq"],
             True, True,
             pulse_idx, eps_spin, eps_cav, eps_spin_y,
-            ps_flag, use_ext
+            ps_flag, use_ext,
+            cav_markovian, cav_rwa, rwa_interaction,
+            spin_bath_on, spin_markovian, spin_axis,
         )
 
     # Base pass computes the single-well keep-mask; the kicked passes reuse it
